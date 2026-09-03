@@ -1,0 +1,6 @@
+/target/
+*.swp
+*.bak
+*~
+.DS_Store
+Issues/

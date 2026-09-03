@@ -1,0 +1,8 @@
+[Unit]
+Description=demon-mac — periodic MAC rotation check
+Documentation=file:///home/alex/Er/demons/demon-mac/README.md
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/demon-mac rotate

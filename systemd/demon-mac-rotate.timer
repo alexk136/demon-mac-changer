@@ -1,0 +1,11 @@
+[Unit]
+Description=demon-mac — periodic MAC rotation check (daily/weekly/monthly policy)
+Documentation=file:///home/alex/Er/demons/demon-mac/README.md
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

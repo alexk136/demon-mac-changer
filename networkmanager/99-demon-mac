@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# 99-demon-mac — NetworkManager dispatcher hook for MAC rotation.
+#
+# NetworkManager invokes dispatcher scripts in
+# /etc/NetworkManager/dispatcher.d/ with two positional args:
+#   $1 = interface name (e.g. eth0, wlan0)
+#   $2 = event name (e.g. pre-up, up, dhcp4-change, hostname)
+#
+# We only react to "pre-up" — the moment before NM configures the
+# interface. This is important: by the time "up" fires, NM has
+# already broadcast the original MAC via DHCP. pre-up ensures the
+# new MAC is in place before DHCP, so the first DHCP request carries
+# the randomized MAC.
+#
+# All policy logic lives in /usr/local/sbin/demon-mac.
+#
+set -euo pipefail
+
+IFACE="${1:-}"
+EVENT="${2:-}"
+
+[[ "$EVENT" == "pre-up" ]] || exit 0
+[[ -n "$IFACE" ]] || exit 0
+
+exec /usr/local/sbin/demon-mac connection "$IFACE"

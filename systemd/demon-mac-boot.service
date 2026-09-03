@@ -1,0 +1,13 @@
+[Unit]
+Description=demon-mac — MAC address randomization at boot
+Documentation=file:///home/alex/Er/demons/demon-mac/README.md
+After=systemd-udevd.service
+Before=network.target network-pre.target NetworkManager.service systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/demon-mac boot
+
+[Install]
+WantedBy=multi-user.target

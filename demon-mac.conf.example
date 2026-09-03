@@ -1,0 +1,54 @@
+# /etc/demon-mac.conf — configuration for demon-mac
+#
+# Copy from demon-mac.conf.example and edit. All keys are
+# shell-sourceable KEY=VALUE.
+
+# ===== Master kill-switch =====
+# false  → script exits 0 immediately with a log line; nothing happens
+# true   → script proceeds to ROTATION_POLICY logic below
+ENABLED=true
+
+# ===== Rotation policy =====
+# Controls when and how often MAC addresses are randomized.
+#
+# connection — rotate on every NetworkManager pre-up event
+#              (default; laptop / portable use case)
+# boot       — rotate on every boot
+#              (desktop / server that reboots often)
+# once       — rotate the first time invoked, then persist forever
+#              (escape MAC binding once, keep new MAC stable)
+# daily      — rotate if last rotation > 24h ago
+# weekly     — rotate if last rotation > 7d ago
+# monthly    — rotate if last rotation > 30d ago
+#
+# For periodic modes (daily/weekly/monthly), demon-mac-rotate.timer
+# fires daily and checks the state file. If you want rotation even
+# without network churn, this is the correct choice.
+ROTATION_POLICY=connection
+
+# ===== Per-iface targeting =====
+# Empty = all physical Ethernet/Wi-Fi interfaces.
+# Comma-separated list = only these interfaces.
+# Examples:
+#   TARGETS=""          # all physical
+#   TARGETS="eth0"      # only eth0
+#   TARGETS="wlan0,eth0"
+TARGETS=
+
+# ===== State file =====
+# Persists last-rotation timestamp per iface. Used by once / daily /
+# weekly / monthly policies. Survives uninstall — operator-managed.
+STATE_FILE=/var/lib/demon-mac/state
+
+# ===== IPv6 SLAAC stabilization =====
+# After MAC change, set net.ipv6.conf.<iface>.addr_gen_mode=1 so that
+# IPv6 link-local no longer derives from MAC. Recommended: keep true.
+STABILIZE_IPV6=true
+
+# ===== Logging =====
+# Log to journald always (under tag "demon-mac"). Additionally to
+# this file if set:
+LOG_FILE=/var/log/demon-mac.log
+
+# debug|info|warn|error
+LOG_LEVEL=info
