@@ -5,7 +5,8 @@
 Randomize host MAC address at boot, on each network connection, and on a
 periodic schedule. Operator can choose rotation policy via a single
 config key, and disable via 3 layers (config flag, systemd disable,
-uninstall).
+uninstall). Supports per-SSID pinning and 2-octet MAC prefix for use
+with MAC-Authenticated networks.
 
 ## Components
 
@@ -14,31 +15,40 @@ uninstall).
 │ triggers                                                         │
 │   ├─ systemd: demon-mac-boot.service (oneshot @ multi-user)     │
 │   ├─ NM dispatcher: 99-demon-mac (pre-up event)                 │
+│   │     └─ argv3 = $CONNECTION_ID (SSID/profile name)            │
 │   └─ systemd timer: demon-mac-rotate.timer (OnCalendar=daily)   │
 │       └─ → demon-mac-rotate.service → demon-mac rotate          │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ demon-mac.sh <mode> [iface]                                      │
+│ demon-mac.sh <mode> [iface] [ssid]                                │
 │   mode = boot | connection | rotate                              │
+│   argv2 = iface (connection mode only)                           │
+│   argv3 = ssid  (connection mode only; empty for boot/rotate)    │
 │                                                                    │
 │   1. parse args (exit 64 on bad)                                  │
 │   2. source /etc/demon-mac.conf                                   │
 │   3. ENABLED gate (exit 0 if not true)                            │
-│   4. defaults: ROTATION_POLICY=connection, STATE_FILE=...         │
-│   5. iterate physical ifaces (filtered by TARGETS)                │
-│   6. should_rotate(iface, trigger) → checks ROTATION_POLICY + state│
-│   7. apply_change(iface):                                        │
-│        - generate_mac() → 02:xx:xx:xx:xx:xx                     │
-│        - ip link set down / address / up                         │
+│   4. validate MAC_PREFIX (locally-administered first byte)        │
+│   5. defaults: ROTATION_POLICY=connection, STATE_FILE=...        │
+│   6. lookup_key(trigger, iface, ssid):                            │
+│        - connection + PIN_MODE=ssid + ssid non-empty → ssid      │
+│        - else → "" (per-iface pin)                                │
+│   7. iterate physical ifaces (filtered by TARGETS)                │
+│   8. should_rotate(iface, ssid, trigger) → checks ROTATION_POLICY│
+│        + reads state for (iface, key)                             │
+│   9. apply_change(iface, key):                                    │
+│        - generate_mac() → prefix:XX:XX:XX:XX or full random       │
+│        - ip link set down / address / / /                          │
 │        - sysctl addr_gen_mode=1 (if STABILIZE_IPV6=true)         │
-│        - write_state(iface, mac, iso-ts)                         │
+│        - write_state(iface, key, mac, iso-ts)                    │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ audit                                                             │
+│ audit
+                        │
 │   ├─ journald (always, tag "demon-mac")                          │
 │   └─ LOG_FILE (if set, append-only)                               │
 └─────────────────────────────────────────────────────────────────┘
@@ -46,12 +56,30 @@ uninstall).
 
 ## State file
 
-`/var/lib/demon-mac/state` — pipe-separated, one record per iface:
+`/var/lib/demon-mac/state` — pipe-separated, one record per
+(iface, ssid):
 
+**New format (4 columns):**
+```
+wlan0|home-wifi|02:11:34:7a:bc:de|2026-09-03T10:00:00Z
+wlan0|work-wifi|02:11:98:1f:23:45|2026-09-03T11:30:00Z
+eth0||02:ab:cd:ef:01:23|2026-09-03T09:00:00Z        # boot-pin (empty ssid)
+```
+
+**Legacy format (3 columns, still readable):**
 ```
 eth0|02:ab:cd:ef:01:23|2026-09-03T10:00:00Z
-wlan0|02:11:22:33:44:55|2026-09-03T10:00:00Z
 ```
+
+Read functions probe both formats in this order:
+
+1. `iface|ssid|mac|ts` — exact (iface, ssid) match
+2. `iface||mac|ts` — empty SSID match (per-iface pin)
+3. Legacy `iface|mac|ts` (3 columns) — iface-only match
+
+Write always uses new format. When writing boot-pin (empty key), the
+script replaces both empty-SSID new entries AND legacy entries for the
+same iface (so the file converges to new format over time).
 
 - Created on first apply; missing file is a normal state.
 - Survives `uninstall.sh` (operator-managed; if you want a fresh start,
@@ -60,46 +88,65 @@ wlan0|02:11:22:33:44:55|2026-09-03T10:00:00Z
 
 ## MAC generation
 
-`generate_mac()` produces 5 random bytes from `/dev/urandom` and
-prepends the locally-administered octet `02:`:
+`generate_mac()` produces 4 or 5 random bytes from `/dev/urandom` and
+formats with optional prefix:
 
+**With `MAC_PREFIX=02:11`** (2 octets fixed, 4 octets random):
+```
+02:11:XX:XX:XX:XX
+```
+
+**Without prefix** (full random, first byte forced to `02`):
+```
+02:XX:XX:XX:XX:XX
+```
+
+The `02` first byte means:
 | Bit | Value | Meaning |
 |---|---|---|
 | 0 (multicast) | 0 | unicast |
 | 1 (U/L) | 1 | locally administered |
 | 2-7 | random | rest of vendor space |
 
-This guarantees:
+For `MAC_PREFIX`, the script validates that the first byte also has
+bits 0=0, 1=1 (locally-administered unicast). Valid first bytes:
+`02, 06, 0A, 0E, 12, ..., 7E, 82, ..., FE` (64 values).
+Invalid prefix → WARN log + full random fallback.
 
-- Never a real OUI (locally-administered bit set).
-- Never multicast (multicast bit clear).
-- Never reserved.
+## Pin key resolution
+
+`lookup_key(trigger, iface, ssid)` returns:
+- `ssid` if `trigger=connection && PIN_MODE=ssid && ssid non-empty`
+- `""` otherwise (per-iface pin)
+
+| `PIN_MODE` | connection mode | boot/rotate mode |
+|---|---|---|
+| `none` | key="" (per-iface) | key="" (per-iface) |
+| `ssid` | key=ssid (per-SSID) | key="" (per-iface) |
+| `iface` | key="" (per-iface) | key="" (per-iface) |
 
 ## Rotation policy decision
 
-`should_rotate(iface, trigger)` returns 0 (yes) or 1 (no) based on
-`ROTATION_POLICY`:
+`should_rotate(iface, ssid, trigger)` returns 0 (yes) or 1 (no) based
+on `ROTATION_POLICY` and the resolved lookup key:
 
 | Policy | Decision |
 |---|---|
 | `connection` | rotate iff trigger == `connection` |
 | `boot` | rotate iff trigger == `boot` |
-| `once` | rotate iff iface not in state |
-| `daily` | rotate iff state age > 86400s (or iface not in state) |
-| `weekly` | rotate iff state age > 604800s (or iface not in state) |
-| `monthly` | rotate iff state age > 2592000s (or iface not in state) |
+| `once` | rotate iff `(iface, key)` not in state |
+| `daily` | rotate iff state age > 86400s (or key not in state) |
+| `weekly` | rotate iff state age > 604800s (or key not in state) |
+| `monthly` | rotate iff state age > 2592000s (or key not in state) |
 | _unknown_ | fail safe: rotate |
-
-For periodic policies, the timer + boot + connection triggers all
-consult the state file; whichever fires first post-expiration wins.
 
 ## Trigger matrix
 
-| Trigger | Source | Mode called | Iterates |
-|---|---|---|---|
-| `boot` | `demon-mac-boot.service` | `boot` | all physical ifaces |
-| `connection` | NM `pre-up` event | `connection <iface>` | single iface |
-| `rotate` | `demon-mac-rotate.timer` | `rotate` | all physical ifaces |
+| Trigger | Source | Mode called | Iterates | Args |
+|---|---|---|---|---|
+| `boot` | `demon-mac-boot.service` | `boot` | all physical ifaces | (none) |
+| `connection` | NM `pre-up` event | `connection <iface> <ssid>` | single iface | argv3 = NM `$CONNECTION_ID` |
+| `rotate` | `demon-mac-rotate.timer` | `rotate` | all physical ifaces | (none) |
 
 ## Disable model (3-layer)
 
@@ -115,6 +162,14 @@ The script always exits 0 unless argument parsing fails (exit 64).
 Per-iface errors (driver rejects, MAC collision, down/up failure)
 are logged but do not propagate. This ensures systemd boot proceeds
 and NM does not retry on its own.
+
+## Backward compatibility
+
+- Script reads both legacy (3-column) and new (4-column) state formats.
+- Existing installations with legacy state continue to work.
+- New writes always use 4-column format.
+- Boot-mode writes replace both legacy and empty-SSID new entries for
+  the same iface, converging to new format over time.
 
 ## See also
 

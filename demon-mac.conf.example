@@ -24,7 +24,41 @@ ENABLED=true
 # For periodic modes (daily/weekly/monthly), demon-mac-rotate.timer
 # fires daily and checks the state file. If you want rotation even
 # without network churn, this is the correct choice.
+#
+# Policy applies PER PIN-MODE key:
+#   - PIN_MODE=none  → state key is iface only
+#   - PIN_MODE=ssid  → state key is (iface, SSID) in connection mode,
+#                      iface only in boot/rotate mode
+#   - PIN_MODE=iface → state key is always iface
 ROTATION_POLICY=connection
+
+# ===== Pin mode =====
+# How the script identifies "the same network" for reuse.
+#
+# none  — rotate every trigger (current default; maximum rotation)
+# ssid  — reuse MAC per SSID in connection mode; per iface in boot/rotate.
+#         Connects to MAC ACL on home Wi-Fi without losing rotation between
+#         networks: each SSID gets its own stable MAC, different across SSIDs.
+# iface — always pin per interface (boot/connection both reuse per-iface).
+#
+# Pair with MAC_PREFIX= to constrain generated MACs to a chosen range —
+# useful if your router only allows full-MAC matches (operator adds the
+# pinned MAC once after first connect).
+PIN_MODE=ssid
+
+# ===== MAC prefix =====
+# Optional 2-octet prefix for generated MACs. Format: XX:XX (hex).
+# Empty = full random (with first octet forced to 02 for locally-administered
+# unicast).
+#
+# When set, generated MAC = PREFIX + 4 random octets:
+#   MAC_PREFIX=02:11   →  MAC = 02:11:XX:XX:XX:XX  (32 bits random)
+#
+# First byte MUST be locally-administered + unicast
+# (bit 0 = multicast = 0, bit 1 = U/L = 1; first_byte & 0x03 == 0x02).
+# Valid first bytes: 02, 06, 0A, 0E, 12, ..., 7E, 82, ..., FE.
+# Invalid prefixes are logged and the script falls back to full random.
+MAC_PREFIX=02:11
 
 # ===== Per-iface targeting =====
 # Empty = all physical Ethernet/Wi-Fi interfaces.
@@ -36,8 +70,10 @@ ROTATION_POLICY=connection
 TARGETS=
 
 # ===== State file =====
-# Persists last-rotation timestamp per iface. Used by once / daily /
-# weekly / monthly policies. Survives uninstall — operator-managed.
+# Persists last-rotation timestamp per (iface, ssid) or (iface, "").
+# Format: iface|ssid|mac|iso-ts  (4 columns; ssid may be empty for boot-pin)
+# Legacy 3-column format (iface|mac|ts) is still readable.
+# Used by once / daily / weekly / monthly policies. Survives uninstall.
 STATE_FILE=/var/lib/demon-mac/state
 
 # ===== IPv6 SLAAC stabilization =====

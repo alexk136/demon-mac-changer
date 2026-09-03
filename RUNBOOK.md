@@ -53,7 +53,7 @@ systemctl status demon-mac-boot.service
 systemctl list-timers demon-mac-rotate
 journalctl -t demon-mac -n 50
 ip link show dev eth0 | grep ether     # current MAC
-cat /var/lib/demon-mac/state            # last-rotation record
+cat /var/lib/demon-mac/state            # last-rotation record per (iface, ssid)
 ```
 
 ## Switching rotation policy
@@ -62,6 +62,71 @@ cat /var/lib/demon-mac/state            # last-rotation record
 sudo sed -i 's/^ROTATION_POLICY=.*/ROTATION_POLICY=daily/' /etc/demon-mac.conf
 sudo systemctl restart demon-mac-rotate.timer
 ```
+
+## Setting up MAC-authenticated router
+
+This is the typical setup workflow when your router has a MAC ACL.
+
+1. **Edit config** for per-SSID pinning:
+
+   ```sh
+   sudo nano /etc/demon-mac.conf
+   ```
+
+   Set:
+
+   ```sh
+   ENABLED=true
+   ROTATION_POLICY=once      # rotate once per SSID, persist forever
+   PIN_MODE=ssid             # critical: keeps MAC stable per Wi-Fi network
+   MAC_PREFIX=02:11          # optional: constrain to chosen range
+   ```
+
+2. **Install** (or restart if already installed):
+
+   ```sh
+   sudo make install  # or: sudo systemctl restart demon-mac-boot
+   ```
+
+3. **Connect to each SSID once** to generate the pinned MAC:
+
+   ```sh
+   # Connect to home Wi-Fi via NetworkManager GUI or nmcli
+   # The dispatcher hook fires on pre-up and pins a MAC
+   ```
+
+4. **Find the pinned MAC**:
+
+   ```sh
+   cat /var/lib/demon-mac/state
+   # Example output:
+   # wlan0|home-wifi|02:11:34:7a:bc:de|2026-09-03T10:00:00Z
+   # wlan0|work-wifi|02:11:98:1f:23:45|2026-09-03T11:30:00Z
+
+   ip link show dev wlan0 | grep ether
+   # link/ether 02:11:34:7a:bc:de   <-- same as state file
+   ```
+
+5. **Add MAC to router ACL** for each SSID (do this once per network).
+
+6. **From now on**, reconnects reuse the same MAC and pass the ACL.
+
+### Adding a new SSID later
+
+1. Connect to the new SSID (any rotation policy will generate a fresh MAC)
+2. Find the new MAC: `cat /var/lib/demon-mac/state | grep <ssid>`
+3. Add it to the router ACL
+
+### Changing PIN_MODE mid-operation
+
+Switching `PIN_MODE` doesn't break existing state entries — it only
+affects future lookups:
+
+- `none` → `ssid`: future connections will key on SSID, generating
+  new MACs for each (iface, ssid) the first time
+- `ssid` → `none`: future connections ignore SSID and rotate freely
+
+If you want to reset, clear state: `sudo rm /var/lib/demon-mac/state`.
 
 ## Restoring original MAC
 
@@ -91,13 +156,17 @@ trigger rotate again.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| NM keeps reconnecting after each boot | MAC change triggers re-DHCP | Expected; one reconnect is fine |
+| NM keeps reconnecting after each boot | MAC change triggers re-DHCP | Expected; one reconnect is fine; or set `PIN_MODE=ssid` |
 | Wi-Fi won't associate after MAC change | Driver doesn't accept change while associated | Disable Wi-Fi trigger; use wired only |
 | DHCP fails after boot | DHCP server filters by MAC | Either whitelist new MAC, or set `TARGETS=` to skip this iface |
+| Router rejects MAC despite ACL | `PIN_MODE=none` and MAC rotated | Set `PIN_MODE=ssid` so MAC stays stable per network |
+| MAC is `00:xx:xx:xx:xx:xx` after install | `MAC_PREFIX=00:xx` was accepted (universal OUI) | Use prefix with locally-administered first byte (02, 06, 0A, etc.); script warns but still rotates |
+| `INVALID FORMAT` warning in journal | `MAC_PREFIX=` value not `XX:XX` hex | Use 2-byte hex format like `02:11` |
 | IPv6 link-local keeps changing | MAC is changing; SLAAC rebuilds LL | `STABILIZE_IPV6=true` (default) sets `addr_gen_mode=1` |
 | No MAC change on connection event | `CONNECTION_TRIGGER` triggers, but policy != `connection` | Check `ROTATION_POLICY`; for `daily`/etc, rotation happens at next expiration, not on every event |
 | State file corrupted | Operator hand-edit | Delete state file; next rotation will recreate |
 | Policy=`once` but MAC keeps changing | Someone cleared state, or multiple triggers fired | Normal — first trigger rotates and re-writes state |
+| SSID lookup misses on connection | `CONNECTION_ID` empty in NM dispatcher | Check NM version; verify dispatcher gets `$CONNECTION_ID` env (`systemctl restart NetworkManager`) |
 
 ## Driver notes
 
