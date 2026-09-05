@@ -154,8 +154,8 @@ generate_mac() {
     else
         # Full random; first byte forced to 0x02 (locally-administered + unicast + individual).
         hex="$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
-        printf '02:%s:%s:%s:%s:%s:%s\n' \
-            "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}" "${hex:8:2}" "${hex:10:2}"
+        printf '02:%s:%s:%s:%s:%s\n' \
+            "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}" "${hex:8:2}"
     fi
 }
 
@@ -343,7 +343,7 @@ apply_change() {
     local iface="$1" key="$2"
     local new_mac old_mac
     new_mac="$(generate_mac)"
-    old_mac="$(ip -o link show dev "$iface" 2>/dev/null | awk '/link\/ether/ {print $(NF-1)}')"
+    old_mac="$(ip -o link show dev "$iface" 2>/dev/null | awk '/link\/ether/ {for(i=1;i<=NF;i++) if($i=="link/ether") {print $(i+1); exit}}')"
 
     log "iface=$iface key='$key' old_mac=$old_mac new_mac=$new_mac"
 
