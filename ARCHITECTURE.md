@@ -74,8 +74,11 @@ eth0|02:ab:cd:ef:01:23|2026-09-03T10:00:00Z
 Read functions probe both formats in this order:
 
 1. `iface|ssid|mac|ts` — exact (iface, ssid) match
-2. `iface||mac|ts` — empty SSID match (per-iface pin)
-3. Legacy `iface|mac|ts` (3 columns) — iface-only match
+2. Legacy `iface|mac|ts` (3 columns) — iface-only match
+
+All matching is done in `awk` with `NF` + positional `$1`/`$2`
+comparisons, so SSID values containing `|` or any regex metacharacter
+are matched exactly (no shell-glob / grep-regex surprises).
 
 Write always uses new format. When writing boot-pin (empty key), the
 script replaces both empty-SSID new entries AND legacy entries for the
@@ -85,11 +88,15 @@ same iface (so the file converges to new format over time).
 - Survives `uninstall.sh` (operator-managed; if you want a fresh start,
   `rm /var/lib/demon-mac/state` manually).
 - Updated atomically: write to `mktemp` in same dir, then `mv`.
+- File is created with mode `0600`, parent dir mode `0700` —
+  MACs are persistent identifiers and should not be world-readable
+  on a multi-user system.
 
 ## MAC generation
 
-`generate_mac()` produces 4 or 5 random bytes from `/dev/urandom` and
-formats with optional prefix:
+`generate_mac()` produces 4 or 5 random bytes from `/dev/urandom` via
+`head -c N /dev/urandom | od -An -tx1 | tr -d ' \n'` and formats
+with the optional prefix:
 
 **With `MAC_PREFIX=02:11`** (2 octets fixed, 4 octets random):
 ```
@@ -113,9 +120,14 @@ bits 0=0, 1=1 (locally-administered unicast). Valid first bytes:
 `02, 06, 0A, 0E, 12, ..., 7E, 82, ..., FE` (64 values).
 Invalid prefix → WARN log + full random fallback.
 
+After applying the new MAC, the daemon reads the link back and
+compares — some drivers (`brcmfmac`, several Realtek USB chips)
+silently ignore address changes; without the read-back the daemon
+would log success while the link kept the old MAC.
+
 ## Pin key resolution
 
-`lookup_key(trigger, iface, ssid)` returns:
+`lookup_key(trigger, ssid)` returns:
 - `ssid` if `trigger=connection && PIN_MODE=ssid && ssid non-empty`
 - `""` otherwise (per-iface pin)
 
@@ -156,11 +168,50 @@ on `ROTATION_POLICY` and the resolved lookup key:
    `demon-mac-rotate.timer` — triggers never fire.
 3. **Uninstall**: `make uninstall` removes files, units, dispatcher.
 
+## Concurrency / single-flight
+
+`boot`, `rotate.timer` and (when wired) the dispatcher can all
+invoke the daemon within seconds of each other. The first thing
+the daemon does after the ENABLED gate is acquire a non-blocking
+`flock` on `<state_dir>/demon-mac.lock`. The loser exits 0 with
+a log line. This serializes:
+
+- concurrent state-file writes (the `mktemp`+`mv` is atomic on a
+  single FS, but two writers can still race on read-modify-write),
+- two simultaneous `ip link set down/address/up` on the same iface
+  (which can leave the link in a half-down state on some drivers).
+
+The lock lives in the state directory (same local FS as the state
+file, so `flock` semantics hold).
+
+## NetworkManager interaction
+
+NM ≥ 1.4 stores `802-11-wireless.cloned-mac-address` /
+`ethernet.cloned-mac-address` on each connection profile. If the
+profile is `random`/`stable`/`permanent`, NM rewrites the MAC on
+profile activation — the daemon's `ip link set address` becomes a
+no-op.
+
+With `NM_CLONED_MAC_POLICY=preserve` (default), after every
+successful `connection`-mode rotation the daemon idempotently
+calls:
+
+```
+nmcli connection modify uuid "$CONNECTION_UUID" \
+    cloned-mac-address preserve
+```
+
+(Skipped if already `preserve`; requires `nmcli` in `PATH` and
+`CONNECTION_UUID` exported by the dispatcher — `99-demon-mac`
+does the export.) The boot and rotate triggers skip this — there's
+no profile context in those modes.
+
 ## Failure isolation
 
-The script always exits 0 unless argument parsing fails (exit 64).
-Per-iface errors (driver rejects, MAC collision, down/up failure)
-are logged but do not propagate. This ensures systemd boot proceeds
+The script always exits 0 unless argument parsing fails (exit 64)
+or the daemon was rejected by the lock. Per-iface errors (driver
+rejects, MAC collision, down/up failure, post-set mismatch) are
+logged but do not propagate. This ensures systemd boot proceeds
 and NM does not retry on its own.
 
 ## Backward compatibility

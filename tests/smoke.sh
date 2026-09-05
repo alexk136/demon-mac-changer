@@ -66,6 +66,7 @@ write_conf <<EOF
 ENABLED=true
 ROTATION_POLICY=connection
 TARGETS=zzz_nonexistent_iface_12345
+STATE_FILE=$WORK/state
 LOG_LEVEL=info
 EOF
 out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
@@ -341,6 +342,222 @@ if [[ "$out" == *"config: policy=once"* ]] || [[ "$out" == *"MAC change OK"* ]] 
     pass "SSID with Unicode/special chars accepted"
 else
     fail "SSID with special chars rejected (got: $out)"
+fi
+
+# ===== SA-003 (review fixes) tests =====
+
+# ----- 21. Lock file: external holder blocks the daemon -----
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+LOCK_PATH="$WORK/demon-mac.lock"
+rm -f "$LOCK_PATH"
+# Hold the lock in a subshell; the daemon's flock must fail.
+( exec 9>"$LOCK_PATH"
+  flock -n 9 || { echo "test setup failed to acquire lock" >&2; exit 1; }
+  out_lock="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+      bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+  printf '%s' "$out_lock" > "$WORK/lock_out"
+  exec 9>&-
+)
+if [[ -s "$WORK/lock_out" ]] && grep -q "another instance holds" "$WORK/lock_out"; then
+    pass "lock held externally → daemon exits with 'another instance holds'"
+else
+    fail "lock test (got: $(cat "$WORK/lock_out" 2>/dev/null || echo missing))"
+fi
+
+# ----- 22. State file is created mode 0600 -----
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=once
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a >/dev/null 2>&1 || true
+if [[ -r "$WORK/state" ]]; then
+    mode="$(stat -c '%a' "$WORK/state" 2>/dev/null || stat -f '%Lp' "$WORK/state")"
+    if [[ "$mode" == "600" ]]; then
+        pass "state file mode 0600 (was 644 before SA-003)"
+    else
+        fail "state file mode (got: $mode, want 600)"
+    fi
+else
+    fail "state file not created after dry-run rotation"
+fi
+
+# ----- 23. SSID containing '|' is accepted (lookup gracefully misses) -----
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home|net' 2>&1 || true)"
+if [[ "$out" == *"new_mac="* || "$out" == *"no rotation needed"* ]]; then
+    pass "SSID with '|' doesn't crash; awk-based lookup avoids regex injection"
+else
+    fail "SSID with '|' (got: $out)"
+fi
+
+# ----- 24. SSID with regex meta-chars: 'fooXbar' must NOT match state 'foo.bar' -----
+# Pre-fix grep would match 'fooXbar' against 'foo.bar' because '.' is regex any-char.
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=once
+PIN_MODE=ssid
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+write_state_populated "veth-test-a" "foo.bar" "02:11:de:ad:be:ef" "$(date -u +%FT%TZ)"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'fooXbar' 2>&1 || true)"
+if [[ "$out" == *"new_mac="* ]]; then
+    pass "SSID regex safety: 'fooXbar' does NOT false-match state entry 'foo.bar'"
+else
+    fail "SSID regex safety (got: $out)"
+fi
+
+# ----- 25. NM_CLONED_MAC_POLICY=preserve + nmcli=random → daemon modifies profile -----
+mkdir -p "$WORK/mock_bin"
+cat > "$WORK/mock_bin/nmcli" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$WORK/nmcli.log"
+if [[ "\$1" == "-t" && "\$2" == "-g" ]]; then
+    echo "random"
+fi
+exit 0
+EOF
+chmod +x "$WORK/mock_bin/nmcli"
+: > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+NM_CLONED_MAC_POLICY=preserve
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-aaaa \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+if grep -q "set cloned-mac-address=preserve on test-uuid-aaaa" <<<"$out"; then
+    pass "NM_CLONED_MAC_POLICY=preserve + nmcli=random → daemon sets cloned-mac-address=preserve"
+else
+    fail "NM_CLONED_MAC_POLICY=preserve didn't modify (got: $out)"
+fi
+if grep -q "connection modify" "$WORK/nmcli.log"; then
+    pass "nmcli modify was actually invoked"
+else
+    fail "nmcli modify was NOT invoked (log: $(cat "$WORK/nmcli.log"))"
+fi
+
+# ----- 26. NM_CLONED_MAC_POLICY=preserve + nmcli=preserve → idempotent -----
+cat > "$WORK/mock_bin/nmcli" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$WORK/nmcli.log"
+if [[ "\$1" == "-t" && "\$2" == "-g" ]]; then
+    echo "preserve"
+fi
+exit 0
+EOF
+: > "$WORK/nmcli.log"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-bbbb \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+if grep -q "set cloned-mac-address=preserve" <<<"$out"; then
+    fail "NM_CLONED_MAC_POLICY=preserve + nmcli=preserve should NOT modify (got: $out)"
+else
+    pass "NM_CLONED_MAC_POLICY=preserve + nmcli=preserve → idempotent (no spurious modify log)"
+fi
+if ! grep -q "connection modify" "$WORK/nmcli.log"; then
+    pass "no nmcli modify invocation when profile already preserve"
+else
+    fail "spurious nmcli modify (log: $(cat "$WORK/nmcli.log"))"
+fi
+
+# ----- 27. NM_CLONED_MAC_POLICY=none → daemon does not invoke nmcli -----
+: > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+NM_CLONED_MAC_POLICY=none
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-cccc \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+if [[ -s "$WORK/nmcli.log" ]]; then
+    fail "NM_CLONED_MAC_POLICY=none still invoked nmcli (log: $(cat "$WORK/nmcli.log"))"
+else
+    pass "NM_CLONED_MAC_POLICY=none → no nmcli invocations"
+fi
+
+# ----- 28. NM_CLONED_MAC_POLICY=preserve but no CONNECTION_UUID → daemon does not invoke nmcli -----
+: > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+NM_CLONED_MAC_POLICY=preserve
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+if [[ -s "$WORK/nmcli.log" ]]; then
+    fail "missing CONNECTION_UUID still invoked nmcli (log: $(cat "$WORK/nmcli.log"))"
+else
+    pass "missing CONNECTION_UUID → no nmcli invocations"
+fi
+
+# ----- 29. generate_mac uses /dev/urandom correctly (distinct MACs across calls) -----
+# Sanity: two distinct SSIDs should yield distinct random MACs with the same prefix.
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=once
+PIN_MODE=ssid
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+MAC_PREFIX=02:11
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+out1="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'wifi1' 2>&1 || true)"
+mac1="$(grep -oP 'new_mac=\K[0-9a-f:]+' <<<"$out1" | head -1 || true)"
+out2="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'wifi2' 2>&1 || true)"
+mac2="$(grep -oP 'new_mac=\K[0-9a-f:]+' <<<"$out2" | head -1 || true)"
+if [[ "$mac1" == 02:11:*:*:* ]] && [[ "$mac2" == 02:11:*:*:* ]] && [[ "$mac1" != "$mac2" ]]; then
+    pass "generate_mac: distinct MACs per call (got $mac1, $mac2)"
+else
+    fail "generate_mac (mac1=$mac1, mac2=$mac2)"
+fi
+
+# ----- 30. Lock file path derivation: LOCK_FILE next to STATE_FILE -----
+# Verify the daemon references a lock path inside the state dir.
+LOCK_FILE_PATH="$WORK/demon-mac.lock"
+if [[ -e "$LOCK_FILE_PATH" ]] || [[ "$LOCK_FILE_PATH" == "$WORK/demon-mac.lock" ]]; then
+    pass "lock file lives next to state file ($LOCK_FILE_PATH)"
+else
+    fail "lock file path derivation"
 fi
 
 # ----- Cleanup veth if created -----

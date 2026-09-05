@@ -53,7 +53,15 @@ systemctl status demon-mac-boot.service
 systemctl list-timers demon-mac-rotate
 journalctl -t demon-mac -n 50
 ip link show dev eth0 | grep ether     # current MAC
-cat /var/lib/demon-mac/state            # last-rotation record per (iface, ssid)
+sudo cat /var/lib/demon-mac/state      # last-rotation record per (iface, ssid); file is mode 0600
+```
+
+Inspect the active NM profile's `cloned-mac-address` setting:
+
+```sh
+nmcli -t -g 802-11-wireless.cloned-mac-address,cloned-mac-address \
+    con show uuid "$CONNECTION_UUID"
+# expect: preserve
 ```
 
 ## Switching rotation policy
@@ -156,8 +164,10 @@ trigger rotate again.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| MAC reverts to original a few seconds after rotation | NM profile has `cloned-mac-address=random`/`stable` and overrides the daemon | Confirm daemon log shows `set cloned-mac-address=preserve`; if not, set `NM_CLONED_MAC_POLICY=preserve` (default) or run `nmcli connection modify uuid <UUID> cloned-mac-address preserve` by hand |
+| Daemon logs `post-set MAC mismatch` | Driver (often `brcmfmac` or Realtek USB) silently rejected the address change | Check `dmesg`; if `iw`/`ip link` shows the old MAC after the daemon's run, the chip can't change MAC while associated — skip that iface via `TARGETS` |
 | NM keeps reconnecting after each boot | MAC change triggers re-DHCP | Expected; one reconnect is fine; or set `PIN_MODE=ssid` |
-| Wi-Fi won't associate after MAC change | Driver doesn't accept change while associated | Disable Wi-Fi trigger; use wired only |
+| Wi-Fi won't associate after MAC change | Driver doesn't accept change while associated | Disable Wi-Fi trigger; use wired only (e.g. `TARGETS=eth0`) |
 | DHCP fails after boot | DHCP server filters by MAC | Either whitelist new MAC, or set `TARGETS=` to skip this iface |
 | Router rejects MAC despite ACL | `PIN_MODE=none` and MAC rotated | Set `PIN_MODE=ssid` so MAC stays stable per network |
 | MAC is `00:xx:xx:xx:xx:xx` after install | `MAC_PREFIX=00:xx` was accepted (universal OUI) | Use prefix with locally-administered first byte (02, 06, 0A, etc.); script warns but still rotates |
@@ -167,6 +177,8 @@ trigger rotate again.
 | State file corrupted | Operator hand-edit | Delete state file; next rotation will recreate |
 | Policy=`once` but MAC keeps changing | Someone cleared state, or multiple triggers fired | Normal — first trigger rotates and re-writes state |
 | SSID lookup misses on connection | `CONNECTION_ID` empty in NM dispatcher | Check NM version; verify dispatcher gets `$CONNECTION_ID` env (`systemctl restart NetworkManager`) |
+| Log shows `another instance holds ... exiting` | Two triggers (e.g. boot + rotate.timer) ran within the lock window | Expected; the losing invocation is a no-op. If persistent, check `flock` availability (`type flock`) |
+| Permission denied reading `/var/lib/demon-mac/state` | File is mode 0600 by design | Use `sudo`; the file is restricted because MACs are persistent identifiers |
 
 ## Driver notes
 

@@ -82,6 +82,7 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 LOG_FILE="${LOG_FILE:-}"
 STABILIZE_IPV6="${STABILIZE_IPV6:-true}"
 MAC_PREFIX="${MAC_PREFIX:-}"
+NM_CLONED_MAC_POLICY="${NM_CLONED_MAC_POLICY:-preserve}"  # preserve|none
 
 # ----- MAC_PREFIX validation -----
 # Format: XX:XX (two hex octets separated by colon).
@@ -108,7 +109,29 @@ if [[ "$PIN_MODE" != "none" && "$PIN_MODE" != "ssid" && "$PIN_MODE" != "iface" ]
     PIN_MODE="none"
 fi
 
-log "config: policy=$ROTATION_POLICY pin=$PIN_MODE targets='$TARGETS' prefix='$MAC_PREFIX' state=$STATE_FILE"
+if [[ "$NM_CLONED_MAC_POLICY" != "preserve" && "$NM_CLONED_MAC_POLICY" != "none" ]]; then
+    log "WARN: NM_CLONED_MAC_POLICY='$NM_CLONED_MAC_POLICY' invalid (expected preserve|none); treating as none"
+    NM_CLONED_MAC_POLICY="none"
+fi
+
+log "config: policy=$ROTATION_POLICY pin=$PIN_MODE targets='$TARGETS' prefix='$MAC_PREFIX' state=$STATE_FILE nm=$NM_CLONED_MAC_POLICY"
+
+# ----- Lock -----
+# Single-flight: serialize concurrent invocations (boot + rotate.timer
+# can race within seconds; both call this script). Lock lives next to
+# the state file (same local FS, same dir).
+LOCK_FILE="$(dirname "$STATE_FILE")/demon-mac.lock"
+acquire_lock() {
+    local dir
+    dir="$(dirname "$LOCK_FILE")"
+    [[ -d "$dir" ]] || mkdir -p -m 700 "$dir"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "another instance holds $LOCK_FILE; exiting"
+        exit 0
+    fi
+}
+acquire_lock
 
 # ----- Helpers: filtering -----
 IFS=',' read -ra TARGET_ARR <<< "$TARGETS"
@@ -122,6 +145,23 @@ in_targets() {
     return 1
 }
 
+# Test if an interface is "real enough" to need MAC randomization.
+# Filters:
+#   - lo (loopback; never randomize)
+#   - interfaces without /sys/class/net/<iface>/device (bonds `bond0`,
+#     teams `team0`, bridges `br0`/`br-xyz`, docker `docker0`,
+#     libvirt `virbr0`/`vnet*`, veth pairs `veth*`, tun/tap) — these
+#     have no physical NIC behind them; rotating their MAC is either
+#     pointless or actively disruptive (changing bond-master MAC
+#     confuses aggregation; changing bridge MAC changes bridge ID
+#     and reshuffles the spanning tree).
+#   - interfaces that don't exist (defensive)
+#
+# Bond/team slaves (eth0, eth1) DO have /sys/class/net/<iface>/device
+# and ARE processed — they're real hardware.
+#
+# If you have a weird stack where a bond master has a /device symlink,
+# set TARGETS explicitly to the slave names.
 is_physical() {
     local iface="$1"
     [[ "${DEMON_MAC_BYPASS_PHYSICAL:-0}" == "1" ]] && return 0
@@ -134,7 +174,7 @@ is_physical() {
 # ----- Pin key resolution -----
 # Returns the SSID key for state lookup. Empty = iface-only pin.
 lookup_key() {
-    local trigger="$1" ssid="$3"
+    local trigger="$1" ssid="$2"
     if [[ "$trigger" == "connection" && "$PIN_MODE" == "ssid" && -n "$ssid" ]]; then
         printf '%s' "$ssid"
     else
@@ -147,13 +187,13 @@ generate_mac() {
     local hex
     if [[ -n "$MAC_PREFIX" ]]; then
         # Use configured prefix; remaining 4 octets random.
-        hex="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+        hex="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
         printf '%s:%s:%s:%s:%s:%s\n' \
             "${MAC_PREFIX:0:2}" "${MAC_PREFIX:3:2}" \
             "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}"
     else
         # Full random; first byte forced to 0x02 (locally-administered + unicast + individual).
-        hex="$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+        hex="$(head -c 5 /dev/urandom | od -An -tx1 | tr -d ' \n')"
         printf '02:%s:%s:%s:%s:%s\n' \
             "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}" "${hex:8:2}"
     fi
@@ -164,6 +204,9 @@ generate_mac() {
 #   legacy:  iface|mac|ts            (3 columns)
 #   new:     iface|ssid|mac|ts       (4 columns, ssid may be empty for boot-pin)
 #
+# All field comparisons are awk-based (no shell glob / grep regex), so
+# SSID values containing '|' or regex metacharacters are matched exactly.
+#
 # read_state_mac_for(iface, key): key is SSID or empty.
 # Tries (iface, key) first; falls back to (iface, "") new entry;
 # falls back to legacy iface-only entry.
@@ -172,33 +215,21 @@ read_state_mac_for() {
     [[ -r "$STATE_FILE" ]] || return 1
     local entry
 
-    if [[ -n "$key" ]]; then
-        entry="$(grep "^${iface}|${key}|" "$STATE_FILE" 2>/dev/null | head -1)"
-        if [[ -n "$entry" ]]; then
-            cut -d'|' -f3 <<<"$entry"
-            return 0
-        fi
-    fi
-
-    # New format with empty key: iface||mac|ts
-    entry="$(grep "^${iface}||" "$STATE_FILE" 2>/dev/null | head -1)"
+    entry="$(awk -F'|' -v iface="$iface" -v key="$key" \
+        'NF==4 && $1==iface && $2==key {print $3; exit}' \
+        "$STATE_FILE" 2>/dev/null)"
     if [[ -n "$entry" ]]; then
-        cut -d'|' -f3 <<<"$entry"
+        printf '%s' "$entry"
         return 0
     fi
 
-    # Legacy format: iface|mac|ts (3 fields)
-    local line nfields entry_iface
-    while IFS= read -r line; do
-        nfields="$(awk -F'|' '{print NF}' <<<"$line")"
-        if [[ "$nfields" -eq 3 ]]; then
-            entry_iface="$(cut -d'|' -f1 <<<"$line")"
-            if [[ "$entry_iface" == "$iface" ]]; then
-                cut -d'|' -f2 <<<"$line"
-                return 0
-            fi
-        fi
-    done < "$STATE_FILE"
+    entry="$(awk -F'|' -v iface="$iface" \
+        'NF==3 && $1==iface {print $2; exit}' \
+        "$STATE_FILE" 2>/dev/null)"
+    if [[ -n "$entry" ]]; then
+        printf '%s' "$entry"
+        return 0
+    fi
 
     return 1
 }
@@ -208,31 +239,21 @@ read_state_ts_for() {
     [[ -r "$STATE_FILE" ]] || return 1
     local entry
 
-    if [[ -n "$key" ]]; then
-        entry="$(grep "^${iface}|${key}|" "$STATE_FILE" 2>/dev/null | head -1)"
-        if [[ -n "$entry" ]]; then
-            cut -d'|' -f4 <<<"$entry"
-            return 0
-        fi
-    fi
-
-    entry="$(grep "^${iface}||" "$STATE_FILE" 2>/dev/null | head -1)"
+    entry="$(awk -F'|' -v iface="$iface" -v key="$key" \
+        'NF==4 && $1==iface && $2==key {print $4; exit}' \
+        "$STATE_FILE" 2>/dev/null)"
     if [[ -n "$entry" ]]; then
-        cut -d'|' -f4 <<<"$entry"
+        printf '%s' "$entry"
         return 0
     fi
 
-    local line nfields entry_iface
-    while IFS= read -r line; do
-        nfields="$(awk -F'|' '{print NF}' <<<"$line")"
-        if [[ "$nfields" -eq 3 ]]; then
-            entry_iface="$(cut -d'|' -f1 <<<"$line")"
-            if [[ "$entry_iface" == "$iface" ]]; then
-                cut -d'|' -f3 <<<"$line"
-                return 0
-            fi
-        fi
-    done < "$STATE_FILE"
+    entry="$(awk -F'|' -v iface="$iface" \
+        'NF==3 && $1==iface {print $3; exit}' \
+        "$STATE_FILE" 2>/dev/null)"
+    if [[ -n "$entry" ]]; then
+        printf '%s' "$entry"
+        return 0
+    fi
 
     return 1
 }
@@ -245,31 +266,22 @@ write_state() {
     tmp="$(mktemp -p "$dir" .state.XXXXXX)"
 
     if [[ -r "$STATE_FILE" ]]; then
-        local line nfields entry_iface entry_key
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            nfields="$(awk -F'|' '{print NF}' <<<"$line")"
-            entry_iface="$(cut -d'|' -f1 <<<"$line")"
-            if [[ "$entry_iface" == "$iface" ]]; then
-                if [[ "$nfields" -eq 4 ]]; then
-                    # New format: replace if (iface, ssid) matches the write key
-                    entry_key="$(cut -d'|' -f2 <<<"$line")"
-                    if [[ "$entry_key" == "$key" ]]; then
-                        continue
-                    fi
-                elif [[ "$nfields" -eq 3 ]]; then
-                    # Legacy: replace only if writing boot-pin (empty key)
-                    if [[ -z "$key" ]]; then
-                        continue
-                    fi
-                fi
-            fi
-            printf '%s\n' "$line"
-        done < "$STATE_FILE" >> "$tmp"
+        # Drop matching entries (kept in awk — field-safe, no regex):
+        #   - SSID-pinned write: drop (iface, key) new-format entries only
+        #   - boot-pin write:    drop all entries for this iface (both formats)
+        if [[ -z "$key" ]]; then
+            awk -F'|' -v iface="$iface" \
+                '!(($1==iface) && (NF==4 || NF==3)) {print}' \
+                "$STATE_FILE" >> "$tmp" || true
+        else
+            awk -F'|' -v iface="$iface" -v key="$key" \
+                '!(NF==4 && $1==iface && $2==key) {print}' \
+                "$STATE_FILE" >> "$tmp" || true
+        fi
     fi
 
     printf '%s|%s|%s|%s\n' "$iface" "$key" "$mac" "$ts" >> "$tmp"
-    chmod 644 "$tmp"
+    chmod 600 "$tmp"
     mv "$tmp" "$STATE_FILE"
 }
 
@@ -290,7 +302,7 @@ age_seconds() {
 should_rotate() {
     local iface="$1" ssid="$2" trigger="$3"
     local key
-    key="$(lookup_key "$trigger" "$iface" "$ssid")"
+    key="$(lookup_key "$trigger" "$ssid")"
 
     case "$ROTATION_POLICY" in
         connection)
@@ -338,14 +350,51 @@ should_rotate() {
     esac
 }
 
+# ----- NM cloned-mac-address enforcement -----
+# NM ≥ 1.4 has 802-11-wireless.cloned-mac-address / cloned-mac-address.
+# If the profile is set to `random` or `stable`, NM overwrites our
+# MAC on the next profile activation. `preserve` tells NM to use
+# whatever MAC is currently on the device — i.e. the one we just
+# set. We enforce this idempotently (no-op if already preserve).
+enforce_nm_cloned_mac() {
+    [[ "$MODE" == "connection" ]] || return 0
+    [[ "$NM_CLONED_MAC_POLICY" == "preserve" ]] || return 0
+    [[ -n "${CONNECTION_UUID:-}" ]] || return 0
+    command -v nmcli >/dev/null 2>&1 || return 0
+
+    local current
+    current="$(nmcli -t -g 802-11-wireless.cloned-mac-address con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
+    if [[ -z "$current" || "$current" == "--" ]]; then
+        current="$(nmcli -t -g cloned-mac-address con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
+    fi
+    [[ -z "$current" || "$current" == "--" ]] && current="(default)"
+
+    if [[ "$current" != "preserve" ]]; then
+        if nmcli connection modify uuid "$CONNECTION_UUID" cloned-mac-address preserve 2>/dev/null; then
+            log "INFO: set cloned-mac-address=preserve on $CONNECTION_UUID (was: $current)"
+        else
+            log "WARN: nmcli modify cloned-mac-address=preserve failed for $CONNECTION_UUID (current: $current)"
+        fi
+    fi
+}
+
 # ----- Apply MAC change -----
 apply_change() {
     local iface="$1" key="$2"
-    local new_mac old_mac
+    local new_mac old_mac actual_mac
     new_mac="$(generate_mac)"
     old_mac="$(ip -o link show dev "$iface" 2>/dev/null | awk '/link\/ether/ {for(i=1;i<=NF;i++) if($i=="link/ether") {print $(i+1); exit}}')"
 
     log "iface=$iface key='$key' old_mac=$old_mac new_mac=$new_mac"
+
+    # Short-circuit: kernel already at target MAC (random collision, or
+    # previous change was reverted by driver). Don't flap the link.
+    if [[ -n "$old_mac" && "$old_mac" == "$new_mac" ]]; then
+        log "INFO: iface=$iface already at target MAC; skip link flap"
+        write_state "$iface" "$key" "$new_mac" "$(now_iso)"
+        enforce_nm_cloned_mac
+        return 0
+    fi
 
     if [[ "$DRY_RUN" == "1" ]]; then
         log "DRY_RUN: would down/change/up iface=$iface new_mac=$new_mac"
@@ -353,6 +402,7 @@ apply_change() {
         # without requiring root for a real MAC change. State is metadata, not
         # kernel state; writing it is safe.
         write_state "$iface" "$key" "$new_mac" "$(now_iso)"
+        enforce_nm_cloned_mac
         return 0
     fi
 
@@ -376,11 +426,22 @@ apply_change() {
     fi
     rm -f "$err"
 
+    # Verify the kernel actually accepted the new MAC. Broadcom brcmfmac
+    # and some Realtek drivers silently ignore address changes; without
+    # this check the daemon would log "OK" while the link keeps the
+    # previous MAC.
+    actual_mac="$(ip -o link show dev "$iface" 2>/dev/null | awk '/link\/ether/ {for(i=1;i<=NF;i++) if($i=="link/ether") {print $(i+1); exit}}')"
+    if [[ "$actual_mac" != "$new_mac" ]]; then
+        log "ERROR: iface=$iface post-set MAC mismatch: expected=$new_mac got=$actual_mac; driver rejected change"
+        return 1
+    fi
+
     if [[ "$STABILIZE_IPV6" == "true" ]]; then
         sysctl -qw "net.ipv6.conf.${iface}.addr_gen_mode=1" 2>/dev/null || \
             log "WARN: sysctl addr_gen_mode=1 for $iface failed"
     fi
 
+    enforce_nm_cloned_mac
     write_state "$iface" "$key" "$new_mac" "$(now_iso)"
     log "iface=$iface MAC change OK: $old_mac -> $new_mac"
     return 0
@@ -415,7 +476,7 @@ for iface in "${ifaces[@]}"; do
         skipped=$((skipped + 1))
         continue
     fi
-    key="$(lookup_key "$trigger" "$iface" "$SSID")"
+    key="$(lookup_key "$trigger" "$SSID")"
     if ! should_rotate "$iface" "$SSID" "$trigger"; then
         log "iface $iface key='$key' no rotation needed (trigger=$trigger policy=$ROTATION_POLICY); skip"
         unchanged=$((unchanged + 1))

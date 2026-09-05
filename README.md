@@ -33,7 +33,8 @@ cat /var/lib/demon-mac/state
 | `PIN_MODE` | `none` | One of `none`, `ssid`, `iface` — see [MAC authentication](#mac-authentication-on-filtered-routers) |
 | `MAC_PREFIX` | empty | `XX:XX` hex prefix constraining generated MACs; empty = full random |
 | `TARGETS` | empty | Empty = all physical; else comma-separated iface list |
-| `STATE_FILE` | `/var/lib/demon-mac/state` | Per-(iface, ssid) rotation record (operator-managed) |
+| `STATE_FILE` | `/var/lib/demon-mac/state` | Per-(iface, ssid) rotation record (operator-managed, mode 0600) |
+| `NM_CLONED_MAC_POLICY` | `preserve` | `preserve` (default) / `none` — see [NetworkManager interaction](#networkmanager-interaction) |
 | `STABILIZE_IPV6` | `true` | sysctl `addr_gen_mode=1` after MAC change |
 | `LOG_FILE` | empty | Optional file log (journald always) |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
@@ -133,6 +134,42 @@ connect.
 - **`/etc/NetworkManager/dispatcher.d/99-demon-mac`** — NM dispatcher
   hook; reacts to `pre-up` event, runs
   `demon-mac connection <iface> <SSID>` (NM `$CONNECTION_ID`).
+  Forwards `$CONNECTION_UUID` as env so the daemon can enforce
+  `cloned-mac-address=preserve` on the profile.
+
+## NetworkManager interaction
+
+NetworkManager ≥ 1.4 exposes `802-11-wireless.cloned-mac-address` /
+`ethernet.cloned-mac-address` on each connection profile. Values are
+`random`, `stable`, `preserve`, or `permanent`. The daemon sets the
+MAC via `ip link set address` on `pre-up`, but if the active profile
+is set to anything other than `preserve`, NM will rewrite the MAC on
+the next activation — making the daemon's work invisible.
+
+Default behavior (`NM_CLONED_MAC_POLICY=preserve`): after every
+successful rotation, the daemon calls
+`nmcli connection modify <UUID> cloned-mac-address preserve` on the
+active profile. Idempotent — no-op if already `preserve`. Requires
+`nmcli` in `PATH` and `CONNECTION_UUID` exported by the dispatcher
+(99-demon-mac does this). Boot/rotate triggers skip this — there's
+no profile context.
+
+Set `NM_CLONED_MAC_POLICY=none` if you manage the profile by hand or
+don't use NM.
+
+To inspect the current profile value:
+
+```sh
+nmcli -t -g 802-11-wireless.cloned-mac-address,cloned-mac-address \
+    con show uuid "$CONNECTION_UUID"
+```
+
+The daemon's MAC change is verified by reading the link back
+immediately after `ip link set address`. Some drivers (notably
+`brcmfmac` and several Realtek USB sticks) silently ignore address
+changes; in that case the daemon logs
+`post-set MAC mismatch: ...` and returns failure instead of
+recording a misleading success.
 
 ## Components
 
@@ -152,13 +189,35 @@ connect.
 
 - **Breaks**: MAC-bound DHCP without ACL pre-add, captive portals with
   MAC ACL (unless using `PIN_MODE=ssid`), hardware-bound licensing.
+- **Wi-Fi `down/up` drops the link for ~100–500 ms.** Every rotation
+  on a Wi-Fi iface drops all active TCP sessions, breaks VoIP/VPN
+  keepalive, and interrupts any in-flight downloads. This is the
+  cost of changing the MAC while the interface is up; only some
+  drivers accept an address change without a link flap. If you need
+  unbroken Wi-Fi sessions, use a wired `TARGETS` entry and disable
+  rotation on the wireless iface (e.g. `TARGETS=eth0`).
+- **Wi-Fi drivers**: `down/up` works for most (`iwlwifi`, `ath9k`,
+  `mt76`, `rtw88`). `brcmfmac` (Broadcom) and several Realtek USB
+  sticks either reject the MAC change silently or refuse while
+  associated; the daemon verifies the post-set MAC and logs
+  `post-set MAC mismatch` on rejection. Check `dmesg` if rotation
+  appears to no-op.
 - **IPv6 link-local** changes with MAC; `STABILIZE_IPV6=true` sets
   `addr_gen_mode=1` (random but not MAC-derived).
-- **Wi-Fi**: `down/up` works for most drivers (iwlwifi, ath9k, mt76,
-  rtw88). Some Broadcom chips reject MAC change; check `dmesg`.
+- **NetworkManager MAC race**: see [NetworkManager interaction](#networkmanager-interaction).
+  Without `NM_CLONED_MAC_POLICY=preserve` (or a hand-set profile), NM
+  may overwrite the daemon's MAC on the next reactivation.
 - **Per-SSID pinning weakens in-network privacy** — same MAC across
   visits; visit frequency visible to network-side logging. Cross-SSID
   privacy preserved.
+- **Concurrent triggers**: a `flock` on
+  `<state_dir>/demon-mac.lock` serializes boot + rotate.timer (and
+  any race between dispatcher and timer). If you see
+  `another instance holds ... exiting`, that's expected — the other
+  invocation is in progress.
+- **State file is mode 0600** by design (MACs are persistent
+  identifiers; the dir is 0700). Operators reading `/var/lib/demon-mac/`
+  need root.
 
 ## Tests
 

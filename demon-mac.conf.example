@@ -74,7 +74,26 @@ TARGETS=
 # Format: iface|ssid|mac|iso-ts  (4 columns; ssid may be empty for boot-pin)
 # Legacy 3-column format (iface|mac|ts) is still readable.
 # Used by once / daily / weekly / monthly policies. Survives uninstall.
+# The file is created mode 0600 (MACs are persistent identifiers).
 STATE_FILE=/var/lib/demon-mac/state
+
+# ===== NetworkManager cloned-mac-address policy =====
+# NM ≥ 1.4 exposes 802-11-wireless.cloned-mac-address /
+# ethernet.cloned-mac-address with values random|stable|preserve|
+# permanent. If the active profile is set to anything other than
+# `preserve`, NM will overwrite the MAC the daemon just set on the
+# next profile activation — making the daemon a no-op.
+#
+# preserve (default) — after each successful rotation, the daemon
+#                      calls `nmcli connection modify <UUID>
+#                      cloned-mac-address preserve` (idempotent;
+#                      skipped if already preserve). Requires nmcli
+#                      in PATH and CONNECTION_UUID exported by the
+#                      NM dispatcher (99-demon-mac does this).
+# none               — do not touch the NM profile. Use this if you
+#                      manage the profile by hand or use a non-NM
+#                      stack.
+NM_CLONED_MAC_POLICY=preserve
 
 # ===== IPv6 SLAAC stabilization =====
 # After MAC change, set net.ipv6.conf.<iface>.addr_gen_mode=1 so that

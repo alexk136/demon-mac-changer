@@ -14,13 +14,17 @@
 # the randomized MAC.
 #
 # NetworkManager also sets these env vars before invocation (used
-# here for per-SSID pinning):
+# here for per-SSID pinning and NM profile management):
 #   $CONNECTION_UUID — unique identifier of the connection profile
 #   $CONNECTION_ID   — human-readable profile name (often the SSID)
 #
 # argv3 = $CONNECTION_ID, passed to demon-mac for per-SSID state
 # lookup. With PIN_MODE=ssid, the same SSID reuses its MAC; different
 # SSIDs get different MACs.
+#
+# $CONNECTION_UUID is forwarded as an env var so demon-mac can
+# enforce cloned-mac-address=preserve on the profile (otherwise NM
+# may overwrite the daemon's MAC on the next reactivation).
 #
 # All policy logic lives in /usr/local/sbin/demon-mac.
 #
@@ -32,6 +36,8 @@ EVENT="${2:-}"
 [[ "$EVENT" == "pre-up" ]] || exit 0
 [[ -n "$IFACE" ]] || exit 0
 
-CONNECTION_ID="${CONNECTION_ID:-}"
+: "${CONNECTION_ID:=}"
+export CONNECTION_ID
+export CONNECTION_UUID
 
 exec /usr/local/sbin/demon-mac connection "$IFACE" "$CONNECTION_ID"
