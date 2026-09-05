@@ -350,6 +350,65 @@ should_rotate() {
     esac
 }
 
+# ----- Self-heal: re-apply state-recorded MAC if kernel has drifted -----
+# Used by boot / rotate triggers. The daemon's contract for non-connection
+# policies (daily / weekly / monthly / once / boot) is: "this iface must
+# have the MAC recorded in state, and only rotate when the policy says so."
+# If something (NM profile, driver reset, manual edit) reverted the
+# kernel MAC between daemon runs, force-set it back from state, then
+# enforce the NM profile so the next reactivation doesn't revert again.
+#
+# Not used by connection mode — that policy always rotates fresh on
+# every dispatcher event, so applying the stale state MAC first is
+# pointless (apply_change overwrites it a moment later).
+#
+# Idempotent and cheap: one state read + one ip link show per iface.
+# Bails early if state is empty (no record yet) or kernel matches.
+reconcile_iface() {
+    local iface="$1" key="$2"
+    local expected_mac current_mac
+
+    expected_mac="$(read_state_mac_for "$iface" "$key" 2>/dev/null || true)"
+    [[ -z "$expected_mac" ]] && return 0
+
+    if [[ -n "${DEMON_MAC_FAKE_CURRENT_MAC:-}" ]]; then
+        current_mac="$DEMON_MAC_FAKE_CURRENT_MAC"
+    else
+        current_mac="$(ip -o link show dev "$iface" 2>/dev/null | awk '/link\/ether/ {for(i=1;i<=NF;i++) if($i=="link/ether") {print $(i+1); exit}}')"
+    fi
+    [[ -z "$current_mac" ]] && return 0
+
+    if [[ "$current_mac" == "$expected_mac" ]]; then
+        return 0
+    fi
+
+    log "INFO: iface=$iface MAC drifted from state (kernel=$current_mac state=$expected_mac); re-applying state value"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY_RUN: would re-apply MAC $expected_mac on $iface"
+        enforce_nm_cloned_mac
+        return 0
+    fi
+
+    local err
+    err="$(mktemp)"
+    if ! ip link set dev "$iface" down 2>"$err"; then
+        log "WARN: reconcile down failed for $iface: $(<"$err")"
+        rm -f "$err"
+        return 0
+    fi
+    if ip link set dev "$iface" address "$expected_mac" 2>"$err"; then
+        ip link set dev "$iface" up 2>/dev/null || true
+        log "INFO: iface=$iface MAC re-applied from state: $current_mac -> $expected_mac"
+    else
+        log "WARN: reconcile address failed for $iface: $(<"$err")"
+        ip link set dev "$iface" up 2>/dev/null || true
+    fi
+    rm -f "$err"
+    enforce_nm_cloned_mac
+    return 0
+}
+
 # ----- NM cloned-mac-address enforcement -----
 # NM ≥ 1.4 has 802-11-wireless.cloned-mac-address / cloned-mac-address.
 # If the profile is set to `random` or `stable`, NM overwrites our
@@ -453,6 +512,9 @@ trigger="$MODE"
 ifaces=()
 if [[ "$MODE" == "connection" ]]; then
     ifaces=("$IFACE")
+elif [[ -n "${DEMON_MAC_FAKE_IFACES:-}" ]]; then
+    # Test-only: override the iface list (otherwise we'd need a real iface).
+    IFS=',' read -ra ifaces <<<"$DEMON_MAC_FAKE_IFACES"
 else
     while IFS= read -r line; do
         iface=$(awk '{print $2}' <<<"$line" | tr -d ':')
@@ -477,6 +539,15 @@ for iface in "${ifaces[@]}"; do
         continue
     fi
     key="$(lookup_key "$trigger" "$SSID")"
+
+    # For non-connection policies (daily/weekly/monthly/once/boot) the
+    # daemon's contract is: keep the state-recorded MAC on the iface
+    # between rotations. If something reverted it, restore before
+    # deciding whether to rotate fresh.
+    if [[ "$trigger" != "connection" ]]; then
+        reconcile_iface "$iface" "$key"
+    fi
+
     if ! should_rotate "$iface" "$SSID" "$trigger"; then
         log "iface $iface key='$key' no rotation needed (trigger=$trigger policy=$ROTATION_POLICY); skip"
         unchanged=$((unchanged + 1))

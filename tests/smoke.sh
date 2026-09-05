@@ -560,6 +560,88 @@ else
     fail "lock file path derivation"
 fi
 
+# ===== SA-003 reconcile tests =====
+
+# ----- 31. daily policy + rotate mode + MAC drifted → reconcile re-applies state MAC -----
+# State has MAC 02:11:de:ad:be:ef (fresh). Kernel fake reports 5c:e9:31:2d:b2:6d.
+# Daemon must detect drift and re-apply state value, then skip rotation
+# (state is fresh, daily policy says no rotate).
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=daily
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+fresh_ts="$(date -u +%FT%TZ)"
+write_state_populated "veth-test-a" "" "02:11:de:ad:be:ef" "$fresh_ts"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_FAKE_IFACES=veth-test-a \
+    DEMON_MAC_FAKE_CURRENT_MAC=5c:e9:31:2d:b2:6d \
+    bash "$ROOT/demon-mac.sh" rotate 2>&1 || true)"
+if grep -q "MAC drifted from state" <<<"$out" && grep -q "DRY_RUN: would re-apply MAC 02:11:de:ad:be:ef" <<<"$out"; then
+    pass "daily policy + rotate + MAC drifted → reconcile re-applies state MAC"
+else
+    fail "reconcile drift detection (got: $out)"
+fi
+if grep -q "no rotation needed" <<<"$out"; then
+    pass "daily policy + rotate + fresh state → no new rotation after reconcile"
+else
+    fail "reconcile + fresh state should skip rotation (got: $out)"
+fi
+
+# ----- 32. daily policy + rotate mode + MAC matches state → no reconcile action -----
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=daily
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+fresh_ts="$(date -u +%FT%TZ)"
+write_state_populated "veth-test-a" "" "02:11:de:ad:be:ef" "$fresh_ts"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_FAKE_IFACES=veth-test-a \
+    DEMON_MAC_FAKE_CURRENT_MAC=02:11:de:ad:be:ef \
+    bash "$ROOT/demon-mac.sh" rotate 2>&1 || true)"
+if grep -q "MAC drifted" <<<"$out"; then
+    fail "reconcile should NOT log drift when MAC matches (got: $out)"
+else
+    pass "daily policy + rotate + MAC matches state → no reconcile action"
+fi
+if grep -q "no rotation needed" <<<"$out"; then
+    pass "daily policy + rotate + MAC matches → still no rotation (fresh state)"
+else
+    fail "no rotation expected for fresh state (got: $out)"
+fi
+
+# ----- 33. connection mode + MAC drifted → no reconcile (always rotates) -----
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+rm -f "$WORK/state"
+fresh_ts="$(date -u +%FT%TZ)"
+write_state_populated "veth-test-a" "" "02:11:de:ad:be:ef" "$fresh_ts"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_FAKE_CURRENT_MAC=5c:e9:31:2d:b2:6d \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 2>&1 || true)"
+if grep -q "MAC drifted" <<<"$out"; then
+    fail "connection mode should NOT reconcile (got: $out)"
+else
+    pass "connection mode + MAC drifted → no reconcile (rotation-only)"
+fi
+if grep -q "DRY_RUN: would down/change/up" <<<"$out"; then
+    pass "connection mode + MAC drifted → rotates fresh (overrides reconcile intent)"
+else
+    fail "connection mode should rotate (got: $out)"
+fi
+
 # ----- Cleanup veth if created -----
 if [[ -n "$VETH_A" ]]; then
     ip link del veth-test-a 2>/dev/null || true

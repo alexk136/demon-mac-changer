@@ -97,6 +97,24 @@ a losing invocation exits 0 with a log line.
 | `nmcli` modify fails | WARN log + continue (state and MAC already applied) |
 | Any other error | Log + exit 0 (never break systemd boot) |
 
+## Reconcile (boot / rotate modes only)
+
+For non-connection policies (`daily` / `weekly` / `monthly` / `once` /
+`boot`) the daemon's contract is "this iface must have the MAC recorded
+in state, and only rotate when the policy says so." If something (NM
+profile, driver reset, manual edit) reverted the kernel MAC between
+daemon runs, the daemon re-applies the state value on the next
+`boot` or `rotate.timer` invocation, then enforces the NM profile
+so the next reactivation doesn't revert again.
+
+Skipped in `connection` mode — that policy always rotates fresh on
+every dispatcher event, so re-applying stale state first would just
+be overwritten by `apply_change` a moment later.
+
+If `DEMON_MAC_FAKE_CURRENT_MAC` is set, the daemon uses it instead of
+reading `ip link show` (test-only). If `DEMON_MAC_FAKE_IFACES` is set,
+the daemon iterates those names instead of `ip -o link show` (test-only).
+
 ## Operator override
 
 `/etc/demon-mac.conf` is operator-editable. To pick up changes for the
