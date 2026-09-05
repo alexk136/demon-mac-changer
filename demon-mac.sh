@@ -78,6 +78,7 @@ ROTATION_POLICY="${ROTATION_POLICY:-connection}"
 PIN_MODE="${PIN_MODE:-none}"          # none | ssid | iface
 TARGETS="${TARGETS:-}"
 STATE_FILE="${STATE_FILE:-/var/lib/demon-mac/state}"
+TOUCHED_PROFILES="${TOUCHED_PROFILES:-/var/lib/demon-mac/touched-profiles}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 LOG_FILE="${LOG_FILE:-}"
 STABILIZE_IPV6="${STABILIZE_IPV6:-true}"
@@ -437,30 +438,69 @@ reconcile_iface() {
     return 0
 }
 
-# ----- NM cloned-mac-address enforcement -----
-# NM ≥ 1.4 has 802-11-wireless.cloned-mac-address / cloned-mac-address.
-# If the profile is set to `random` or `stable`, NM overwrites our
-# MAC on the next profile activation. `preserve` tells NM to use
-# whatever MAC is currently on the device — i.e. the one we just
-# set. We enforce this idempotently (no-op if already preserve).
+# ----- Track profiles touched by the daemon (for uninstall restore) -----
+# Records the original NM profile values BEFORE the daemon modifies
+# them. uninstall.sh reads this file and restores the originals.
+# Format: UUID|conn_type|original_cloned|original_random
+#   - conn_type: 802-11-wireless | 802-3-ethernet
+#   - original_cloned: "" (was unset) or the previous MAC literal /
+#     "preserve" / "stable" / "random" / "permanent"
+#   - original_random: "" (was unset / "default") for ethernet always ""
+# Idempotent: if a UUID is already tracked, the new record is ignored
+# so we don't lose the original (e.g. if daemon later also touches
+# random-field on the same profile, we keep the original for both).
+record_touched_profile() {
+    local uuid="$1" conn_type="$2" orig_cloned="$3" orig_random="$4"
+    [[ -z "$uuid" ]] && return 0
+    local file="${DEMON_MAC_TOUCHED_PROFILES:-$TOUCHED_PROFILES}"
+    local dir
+    dir="$(dirname "$file")"
+    [[ -d "$dir" ]] || mkdir -p -m 700 "$dir" 2>/dev/null || return 0
+
+    if [[ -r "$file" ]] && \
+        awk -F'|' -v u="$uuid" '$1==u {found=1} END {exit !found}' "$file"; then
+        return 0
+    fi
+
+    printf '%s|%s|%s|%s\n' "$uuid" "$conn_type" "$orig_cloned" "$orig_random" \
+        >> "$file" 2>/dev/null || return 0
+    chmod 600 "$file" 2>/dev/null || true
+    return 0
+}
+
+# ----- NM cloned-mac-address enforcement (daemon / hybrid mode) -----
+# NM ≥ 1.4 has 802-11-wireless.cloned-mac-address /
+# 802-3-ethernet.cloned-mac-address. If the profile is set to
+# `random` or `stable`, NM overwrites our MAC on the next profile
+# activation. `preserve` tells NM to use whatever MAC is currently
+# on the device — i.e. the one we just set. We enforce this
+# idempotently (no-op if already preserve), and record the original
+# value so uninstall.sh can restore it.
 enforce_nm_cloned_mac() {
     [[ "$MODE" == "connection" ]] || return 0
     [[ "$NM_CLONED_MAC_POLICY" == "preserve" ]] || return 0
     [[ -n "${CONNECTION_UUID:-}" ]] || return 0
     command -v nmcli >/dev/null 2>&1 || return 0
 
+    local conn_type cloned_field
+    conn_type="$(nmcli -t -g connection.type con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
+    case "$conn_type" in
+        802-11-wireless) cloned_field="802-11-wireless.cloned-mac-address" ;;
+        802-3-ethernet)  cloned_field="802-3-ethernet.cloned-mac-address" ;;
+        *) return 0 ;;
+    esac
+
     local current
-    current="$(nmcli -t -g 802-11-wireless.cloned-mac-address con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
-    if [[ -z "$current" || "$current" == "--" ]]; then
-        current="$(nmcli -t -g cloned-mac-address con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
-    fi
+    current="$(nmcli -t -g "$cloned_field" con show uuid "$CONNECTION_UUID" 2>/dev/null | head -1)"
     [[ -z "$current" || "$current" == "--" ]] && current="(default)"
 
     if [[ "$current" != "preserve" ]]; then
-        if nmcli connection modify uuid "$CONNECTION_UUID" cloned-mac-address preserve 2>/dev/null; then
-            log "INFO: set cloned-mac-address=preserve on $CONNECTION_UUID (was: $current)"
+        # Record original before modifying (so uninstall.sh can restore).
+        record_touched_profile "$CONNECTION_UUID" "$conn_type" "$current" ""
+        if nmcli connection modify uuid "$CONNECTION_UUID" "$cloned_field" preserve 2>/dev/null; then
+            log "INFO: set $cloned_field=preserve on $CONNECTION_UUID (was: $current)"
         else
-            log "WARN: nmcli modify cloned-mac-address=preserve failed for $CONNECTION_UUID (current: $current)"
+            log "WARN: nmcli modify $cloned_field=preserve failed for $CONNECTION_UUID (current: $current)"
         fi
     fi
 }
@@ -561,6 +601,8 @@ apply_nm_supervisor() {
     local drift=0 changes=""
 
     if [[ "$current_cloned" != "$target_cloned" ]]; then
+        # Record original before modifying (so uninstall.sh can restore).
+        record_touched_profile "$uuid" "$conn_type" "$current_cloned" "${current_random:-}"
         if nmcli connection modify uuid "$uuid" "$cloned_field" "$target_cloned" 2>/dev/null; then
             changes+=" cloned-mac=${current_cloned}->${target_cloned}"
             drift=1
@@ -570,6 +612,11 @@ apply_nm_supervisor() {
     fi
 
     if [[ -n "$random_field" && "$current_random" != "$target_random" ]]; then
+        # Already-recorded record covers both fields; only record if we
+        # somehow didn't (e.g. cloned matched but random drifted).
+        if [[ "$drift" -eq 0 ]]; then
+            record_touched_profile "$uuid" "$conn_type" "${current_cloned:-}" "$current_random"
+        fi
         if nmcli connection modify uuid "$uuid" "$random_field" "$target_random" 2>/dev/null; then
             changes+=" mac-randomization=${current_random}->${target_random}"
             drift=1

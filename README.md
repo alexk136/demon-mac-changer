@@ -236,6 +236,30 @@ MANAGEMENT_MODE=daemon
 Then `sudo make install` and restart the units. Existing
 `/var/lib/demon-mac/state` keeps working — same format, same perms.
 
+## Uninstall behavior
+
+`sudo make uninstall` reverses the daemon's NM-side mutations:
+
+1. Reads `/var/lib/demon-mac/touched-profiles` — a list of NM connection
+   UUIDs the daemon modified, with the original `cloned-mac-address` and
+   `mac-address-randomization` values captured before each modification.
+2. Calls `nmcli connection modify <UUID> <field> <original>` for each
+   entry, restoring the profile to the pre-demon-mac state.
+3. Removes the daemon files, units, and NM dispatcher.
+4. Removes the touched-profiles file (consumed).
+
+The `/var/lib/demon-mac/state` file (per-(iface, ssid) rotation record
+in daemon mode) is **preserved** — operator-managed. The
+`/etc/demon-mac.conf` is also preserved.
+
+If you ran the daemon only in supervisor mode and never as root on
+this machine, touched-profiles is empty and the restore step is a
+no-op.
+
+If touched-profiles is missing or malformed, the restore step prints
+a warning and continues — no daemon-side mutations are reversed, but
+the rest of uninstall runs.
+
 ## Tests
 
 ```sh

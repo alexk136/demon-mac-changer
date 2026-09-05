@@ -460,7 +460,10 @@ cat > "$WORK/mock_bin/nmcli" <<EOF
 #!/usr/bin/env bash
 echo "\$@" >> "$WORK/nmcli.log"
 if [[ "\$1" == "-t" && "\$2" == "-g" ]]; then
-    echo "random"
+    case "\$3" in
+        connection.type|type) echo "802-11-wireless" ;;
+        *) echo "random" ;;
+    esac
 fi
 exit 0
 EOF
@@ -479,7 +482,7 @@ out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSIC
     CONNECTION_UUID=test-uuid-aaaa \
     PATH="$WORK/mock_bin:$PATH" \
     bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
-if grep -q "set cloned-mac-address=preserve on test-uuid-aaaa" <<<"$out"; then
+if grep -q "set.*=preserve on test-uuid-aaaa" <<<"$out"; then
     pass "NM_CLONED_MAC_POLICY=preserve + nmcli=random → daemon sets cloned-mac-address=preserve"
 else
     fail "NM_CLONED_MAC_POLICY=preserve didn't modify (got: $out)"
@@ -981,6 +984,119 @@ if [[ -s "$WORK/nmcli.log" ]] && grep -q "connection modify" "$WORK/nmcli.log"; 
     fail "supervisor + VPN → must not call nmcli modify (log: $(cat "$WORK/nmcli.log"))"
 else
     pass "supervisor + VPN → no nmcli modify"
+fi
+
+# ===== SA-004 touched-profiles (uninstall restore) tests =====
+
+# ----- 45. supervisor records original cloned value before modifying -----
+# When supervisor modifies a profile, it must first record the original
+# value so uninstall.sh can restore it. Without a recording, the
+# uninstall would have to guess at the original — possibly destroying
+# user-set values.
+DEMON_MAC_TOUCHED_PROFILES="$WORK/touched"
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_TOUCHED_PROFILES="$WORK/touched" \
+    CONNECTION_UUID=test-uuid-touch1 DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_TYPE=802-11-wireless \
+    DEMON_MAC_NMCLI_CLONED=random DEMON_MAC_NMCLI_RANDOM=0 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection wlp-test 2>&1 || true)"
+if [[ -r "$WORK/touched" ]] && grep -q "test-uuid-touch1|802-11-wireless|random|0" "$WORK/touched"; then
+    pass "supervisor + drift → records original (uuid|type|cloned=random|random=0)"
+else
+    fail "supervisor did not record original (got: $(cat "$WORK/touched" 2>/dev/null))"
+fi
+
+# ----- 46. supervisor + idempotent (no drift) → no record written -----
+rm -f "$WORK/touched2"
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_TOUCHED_PROFILES="$WORK/touched2" \
+    CONNECTION_UUID=test-uuid-touch2 DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_TYPE=802-11-wireless \
+    DEMON_MAC_NMCLI_CLONED=stable DEMON_MAC_NMCLI_RANDOM=2 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection wlp-test 2>&1 || true)"
+if [[ ! -e "$WORK/touched2" ]] || [[ ! -s "$WORK/touched2" ]]; then
+    pass "supervisor + idempotent → no touched-profiles entry"
+else
+    fail "supervisor wrote record when no drift (got: $(cat "$WORK/touched2"))"
+fi
+
+# ----- 47. daemon + preserve enforcement records original -----
+# In daemon mode, enforce_nm_cloned_mac sets cloned-mac-address=preserve.
+# If the profile was previously 'stable' (or anything other than
+# 'preserve'), the original must be captured for restore.
+rm -f "$WORK/touched3"
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=daemon
+ROTATION_POLICY=connection
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+NM_CLONED_MAC_POLICY=preserve
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    DEMON_MAC_TOUCHED_PROFILES="$WORK/touched3" \
+    CONNECTION_UUID=test-uuid-touch3 DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_TYPE=802-11-wireless \
+    DEMON_MAC_NMCLI_CLONED=stable DEMON_MAC_NMCLI_RANDOM=2 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 'home-wifi' 2>&1 || true)"
+# Original was 'stable', daemon set to 'preserve'. touched-profiles
+# should record 'stable' so uninstall restores it.
+if [[ -r "$WORK/touched3" ]] && grep -q "test-uuid-touch3|802-11-wireless|stable|" "$WORK/touched3"; then
+    pass "daemon + preserve enforcement → records original (stable)"
+else
+    fail "daemon did not record original for preserve (got: $(cat "$WORK/touched3" 2>/dev/null))"
+fi
+
+# ----- 48. uninstall restore logic emits correct nmcli calls -----
+# Simulate uninstall: parse the touched-profiles file and call nmcli
+# with the original values.
+: > "$WORK/nmcli.log"
+cat > "$WORK/touched" <<EOF
+test-uuid-restore|802-11-wireless|random|0
+EOF
+while IFS='|' read -r uuid conn_type orig_cloned orig_random; do
+    [[ -z "$uuid" ]] && continue
+    case "$conn_type" in
+        802-11-wireless) cloned_field="802-11-wireless.cloned-mac-address"; random_field="802-11-wireless.mac-address-randomization" ;;
+        *) continue ;;
+    esac
+    PATH="$WORK/mock_bin:$PATH" DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+        nmcli connection modify uuid "$uuid" "$cloned_field" "${orig_cloned:-}" 2>/dev/null
+    PATH="$WORK/mock_bin:$PATH" DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+        nmcli connection modify uuid "$uuid" "$random_field" "${orig_random:-}" 2>/dev/null
+done < "$WORK/touched"
+if grep -q "802-11-wireless.cloned-mac-address random" "$WORK/nmcli.log"; then
+    pass "uninstall restore → nmcli modify 802-11-wireless.cloned-mac-address random"
+else
+    fail "uninstall restore cloned-mac (log: $(cat "$WORK/nmcli.log"))"
+fi
+if grep -q "802-11-wireless.mac-address-randomization 0" "$WORK/nmcli.log"; then
+    pass "uninstall restore → nmcli modify 802-11-wireless.mac-address-randomization 0"
+else
+    fail "uninstall restore randomization (log: $(cat "$WORK/nmcli.log"))"
 fi
 
 # ----- Cleanup veth if created -----

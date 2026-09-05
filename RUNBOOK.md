@@ -43,8 +43,20 @@ sudo systemctl disable --now demon-mac-rotate.timer
 sudo make uninstall
 ```
 
+Uninstall reverses the daemon's NM-side mutations: for every
+connection UUID the daemon touched, it restores the original
+`cloned-mac-address` and `mac-address-randomization` values via
+`nmcli connection modify`. The list of touched profiles lives in
+`/var/lib/demon-mac/touched-profiles` (created at runtime by the
+daemon, mode 0600, in the daemon's state directory).
+
 `/etc/demon-mac.conf` and `/var/lib/demon-mac/state` are preserved
-(operator-managed).
+(operator-managed). To fully remove:
+
+```sh
+sudo rm -rf /var/lib/demon-mac
+sudo rm /etc/demon-mac.conf
+```
 
 ## Status check
 
