@@ -5,6 +5,95 @@ on each NetworkManager connection, and (optionally) on a periodic schedule,
 with full kill-switch via config and systemd. Supports per-SSID pinning for
 MAC-authenticated networks.
 
+## Before you install this — try the built-in randomization first
+
+Linux distros that ship NetworkManager and/or systemd-networkd already
+have **upstream-supported, distro-tested** MAC randomization built in.
+For most use cases (a laptop that wants a different MAC on every Wi-Fi
+association) the built-in mechanism is enough — and it's the right
+default because it's maintained by the people who maintain your network
+stack.
+
+**Try this first.** If it solves your problem, you do not need
+demon-mac at all.
+
+### NetworkManager (most desktops and laptops)
+
+NM ≥ 1.4 exposes the per-connection settings you need. There are two
+controls; both live on the connection profile:
+
+| Setting | Values | Effect |
+|---|---|---|
+| `802-11-wireless.cloned-mac-address` | `preserve`, `permanent`, `random`, `stable` | `random` = new MAC on every connection; `stable` = new MAC per-SSID, stable across reconnects |
+| `802-11-wireless.mac-address-randomization` | `0` (default), `1` (never), `2` (always) | Master switch — must be `2` to enable |
+
+To enable per-SSID stable randomization on a profile:
+
+```sh
+nmcli connection modify "<profile-name>" \
+    802-11-wireless.cloned-mac-address stable \
+    802-11-wireless.mac-address-randomization 2
+nmcli connection up "<profile-name>"
+```
+
+Replace `<profile-name>` with the SSID (or any name; `nmcli connection`
+shows it). Inspect the current value with:
+
+```sh
+nmcli -t -f connection,802-11-wireless.cloned-mac-address,802-11-wireless.mac-address-randomization \
+    connection show "<profile-name>"
+```
+
+Docs:
+- [NetworkManager 802-11-wireless settings reference](https://networkmanager.dev/docs/api/latest/settings-802-11-wireless.html) — `cloned-mac-address`, `mac-address-randomization`, `assigned-mac-address`.
+
+### systemd-networkd (servers, minimal installs, NixOS)
+
+systemd-networkd's `.link` files accept `MACAddressPolicy=`:
+
+| Value | Effect |
+|---|---|
+| `persistent` | Default. Stable per-machine MAC derived from `/etc/machine-id` and the device's ID_NET_NAME_* — same on every boot, different from hardware MAC. |
+| `random` | New random MAC on every interface appearance (typically each boot). Locally-administered + unicast bits are set. |
+| `none` | Keep the kernel-assigned MAC. Use this if you want to set a specific MAC with `MACAddress=`. |
+
+```ini
+# /etc/systemd/network/10-mac-randomize.link
+[Match]
+OriginalName=*
+
+[Link]
+MACAddressPolicy=random
+```
+
+Docs: [systemd.link(5) — MACAddressPolicy](https://www.freedesktop.org/software/systemd/man/systemd.link.html).
+
+### Why you might still want demon-mac
+
+The built-in randomization covers the common case. Reach for demon-mac
+when you need:
+
+- **MAC-Authenticated Wi-Fi with per-SSID pinning**: a stable MAC per
+  network, but you only get that out of NM's `stable` mode if you
+  trust NM to keep its state. demon-mac writes its own state file
+  (`/var/lib/demon-mac/state`, mode 0600) and survives reinstalls
+  cleanly.
+- **A constrained prefix**: keep generated MACs inside a chosen
+  16-bit OUI range (`MAC_PREFIX=02:11`) for routers/APs that filter
+  by OUI rather than full-MAC ACL.
+- **Daily/weekly rotation on stable wired links**: NM doesn't
+  rotate on wired connections by default; the systemd timer in
+  demon-mac rotates them on schedule even without network churn.
+- **Self-heal after NM revert**: if NM's `cloned-mac-address`
+  setting was changed by hand or by another tool and NM reverts
+  your MAC, demon-mac's `NM_CLONED_MAC_POLICY=preserve` reasserts
+  preserve on the profile. The built-in mechanism has no such
+  watchdog.
+
+If none of that matters to you, uninstall is `sudo make uninstall`
+and you're back to the disto's default behavior — no daemon, no
+service, no state file.
+
 ## Quick start
 
 ```sh
