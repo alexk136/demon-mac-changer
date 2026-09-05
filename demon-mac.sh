@@ -83,6 +83,8 @@ LOG_FILE="${LOG_FILE:-}"
 STABILIZE_IPV6="${STABILIZE_IPV6:-true}"
 MAC_PREFIX="${MAC_PREFIX:-}"
 NM_CLONED_MAC_POLICY="${NM_CLONED_MAC_POLICY:-preserve}"  # preserve|none
+MANAGEMENT_MODE="${MANAGEMENT_MODE:-supervisor}"          # supervisor|daemon|hybrid
+NM_CLONED_MAC="${NM_CLONED_MAC:-stable}"                  # stable|random (target value in supervisor mode)
 
 # ----- MAC_PREFIX validation -----
 # Format: XX:XX (two hex octets separated by colon).
@@ -114,24 +116,50 @@ if [[ "$NM_CLONED_MAC_POLICY" != "preserve" && "$NM_CLONED_MAC_POLICY" != "none"
     NM_CLONED_MAC_POLICY="none"
 fi
 
-log "config: policy=$ROTATION_POLICY pin=$PIN_MODE targets='$TARGETS' prefix='$MAC_PREFIX' state=$STATE_FILE nm=$NM_CLONED_MAC_POLICY"
+if [[ "$MANAGEMENT_MODE" != "supervisor" && "$MANAGEMENT_MODE" != "daemon" && "$MANAGEMENT_MODE" != "hybrid" ]]; then
+    log "WARN: MANAGEMENT_MODE='$MANAGEMENT_MODE' invalid (expected supervisor|daemon|hybrid); treating as supervisor"
+    MANAGEMENT_MODE="supervisor"
+fi
+
+if [[ "$NM_CLONED_MAC" != "stable" && "$NM_CLONED_MAC" != "random" ]]; then
+    log "WARN: NM_CLONED_MAC='$NM_CLONED_MAC' invalid (expected stable|random); treating as stable"
+    NM_CLONED_MAC="stable"
+fi
+
+# Cross-key sanity: warn loudly when supervisor can't do what the operator asked for.
+if [[ "$MANAGEMENT_MODE" == "supervisor" ]]; then
+    [[ -n "$MAC_PREFIX" ]] && log "WARN: MAC_PREFIX='$MAC_PREFIX' is ignored in supervisor mode (no kernel writes); switch MANAGEMENT_MODE=daemon"
+    case "$ROTATION_POLICY" in
+        daily|weekly|monthly|once|boot)
+            log "WARN: ROTATION_POLICY=$ROTATION_POLICY is ignored in supervisor mode (no kernel writes); switch MANAGEMENT_MODE=daemon or daemon-mode-hybrid"
+            ;;
+    esac
+fi
+
+log "config: mode=$MANAGEMENT_MODE policy=$ROTATION_POLICY pin=$PIN_MODE targets='$TARGETS' prefix='$MAC_PREFIX' state=$STATE_FILE nm_policy=$NM_CLONED_MAC_POLICY nm_target=$NM_CLONED_MAC"
 
 # ----- Lock -----
 # Single-flight: serialize concurrent invocations (boot + rotate.timer
 # can race within seconds; both call this script). Lock lives next to
 # the state file (same local FS, same dir).
-LOCK_FILE="$(dirname "$STATE_FILE")/demon-mac.lock"
-acquire_lock() {
-    local dir
-    dir="$(dirname "$LOCK_FILE")"
-    [[ -d "$dir" ]] || mkdir -p -m 700 "$dir"
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        log "another instance holds $LOCK_FILE; exiting"
-        exit 0
-    fi
-}
-acquire_lock
+#
+# Only needed in daemon/hybrid mode (where we mutate kernel state and
+# write the state file). Supervisor mode is read-only with respect to
+# kernel — nmcli handles its own concurrency.
+if [[ "$MANAGEMENT_MODE" != "supervisor" ]]; then
+    LOCK_FILE="$(dirname "$STATE_FILE")/demon-mac.lock"
+    acquire_lock() {
+        local dir
+        dir="$(dirname "$LOCK_FILE")"
+        [[ -d "$dir" ]] || mkdir -p -m 700 "$dir"
+        exec 9>"$LOCK_FILE"
+        if ! flock -n 9; then
+            log "another instance holds $LOCK_FILE; exiting"
+            exit 0
+        fi
+    }
+    acquire_lock
+fi
 
 # ----- Helpers: filtering -----
 IFS=',' read -ra TARGET_ARR <<< "$TARGETS"
@@ -437,6 +465,127 @@ enforce_nm_cloned_mac() {
     fi
 }
 
+# ----- Supervisor: ensure NM profile has the right cloned-mac settings -----
+# For each iface passed in, find its active NM connection and idempotently
+# ensure:
+#   - <type>.cloned-mac-address              = $NM_CLONED_MAC (stable|random)
+#   - 802-11-wireless.mac-address-randomization = 2            (Wi-Fi only)
+#
+# NM exposes `cloned-mac-address` (the libnm property name) under a
+# type-specific prefix when accessed via `nmcli connection show` /
+# `nmcli connection modify`:
+#   - 802-11-wireless connections  →  802-11-wireless.cloned-mac-address
+#   - 802-3-ethernet connections   →  802-3-ethernet.cloned-mac-address
+# There is no type-agnostic `connection.cloned-mac-address` field on
+# NM 1.x (libnm has it but nmcli auto-prefixes). So we pick the right
+# field based on `connection.type`.
+#
+# `mac-address-randomization` is Wi-Fi-only — it's the master switch
+# that makes NM honor `cloned-mac-address=stable|random` on wireless.
+# Ethernet has no equivalent; setting `cloned-mac-address=random` on
+# an ethernet profile is enough.
+#
+# In hybrid mode the daemon's kernel-direct pass will later set
+# cloned-mac-address=preserve on the profile; here we instead pin
+# mac-address-randomization to 0 so NM doesn't override the daemon's MAC.
+#
+# Returns 0 always; logs drift corrections. No state file, no lock,
+# no kernel writes.
+apply_nm_supervisor() {
+    local iface="$1"
+    local uuid=""
+
+    if [[ -n "${CONNECTION_UUID:-}" ]]; then
+        uuid="$CONNECTION_UUID"
+    elif command -v nmcli >/dev/null 2>&1; then
+        uuid="$(nmcli -t device show "$iface" 2>/dev/null \
+            | sed -n 's/^GENERAL\.CON-UUID://p' | head -1)"
+    fi
+
+    [[ -z "$uuid" ]] && {
+        log "iface=$iface: no active NM connection; supervisor no-op"
+        return 0
+    }
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        log "WARN: nmcli not in PATH; supervisor cannot configure $uuid"
+        return 0
+    fi
+
+    # Determine connection type to pick the right fields. Only Wi-Fi and
+    # Ethernet are relevant for MAC randomization — vpn/gsm/bridge/etc.
+    # are not supported by the supervisor.
+    local conn_type
+    conn_type="$(nmcli -t -g connection.type con show uuid "$uuid" 2>/dev/null | head -1)"
+
+    local cloned_field random_field="" target_random=""
+    case "$conn_type" in
+        802-11-wireless)
+            cloned_field="802-11-wireless.cloned-mac-address"
+            random_field="802-11-wireless.mac-address-randomization"
+            if [[ "$MANAGEMENT_MODE" == "hybrid" ]]; then
+                target_random="0"
+            else
+                target_random="2"
+            fi
+            ;;
+        802-3-ethernet)
+            cloned_field="802-3-ethernet.cloned-mac-address"
+            # No master switch on ethernet; cloned-mac-address alone suffices.
+            ;;
+        *)
+            log "iface=$iface: connection type '$conn_type' is not Wi-Fi or Ethernet; supervisor no-op"
+            return 0
+            ;;
+    esac
+
+    # Resolve target cloned value.
+    local target_cloned
+    if [[ "$MANAGEMENT_MODE" == "hybrid" ]]; then
+        target_cloned="preserve"
+    else
+        target_cloned="$NM_CLONED_MAC"
+    fi
+
+    # Read current values.
+    local current_cloned current_random
+    current_cloned="$(nmcli -t -g "$cloned_field" con show uuid "$uuid" 2>/dev/null | head -1)"
+    [[ -z "$current_cloned" || "$current_cloned" == "--" ]] && current_cloned="(unset)"
+    if [[ -n "$random_field" ]]; then
+        current_random="$(nmcli -t -g "$random_field" con show uuid "$uuid" 2>/dev/null | head -1)"
+        [[ -z "$current_random" || "$current_random" == "--" ]] && current_random="(unset)"
+    else
+        current_random="n/a"
+    fi
+
+    local drift=0 changes=""
+
+    if [[ "$current_cloned" != "$target_cloned" ]]; then
+        if nmcli connection modify uuid "$uuid" "$cloned_field" "$target_cloned" 2>/dev/null; then
+            changes+=" cloned-mac=${current_cloned}->${target_cloned}"
+            drift=1
+        else
+            log "WARN: nmcli modify $cloned_field=$target_cloned failed for $uuid"
+        fi
+    fi
+
+    if [[ -n "$random_field" && "$current_random" != "$target_random" ]]; then
+        if nmcli connection modify uuid "$uuid" "$random_field" "$target_random" 2>/dev/null; then
+            changes+=" mac-randomization=${current_random}->${target_random}"
+            drift=1
+        else
+            log "WARN: nmcli modify $random_field=$target_random failed for $uuid"
+        fi
+    fi
+
+    if [[ "$drift" -eq 0 ]]; then
+        log "iface=$iface: profile $uuid ($conn_type) already supervised (cloned=$current_cloned randomization=$current_random)"
+    else
+        log "iface=$iface: profile $uuid ($conn_type) supervised —$changes"
+    fi
+    return 0
+}
+
 # ----- Apply MAC change -----
 apply_change() {
     local iface="$1" key="$2"
@@ -538,26 +687,40 @@ for iface in "${ifaces[@]}"; do
         skipped=$((skipped + 1))
         continue
     fi
-    key="$(lookup_key "$trigger" "$SSID")"
 
-    # For non-connection policies (daily/weekly/monthly/once/boot) the
-    # daemon's contract is: keep the state-recorded MAC on the iface
-    # between rotations. If something reverted it, restore before
-    # deciding whether to rotate fresh.
-    if [[ "$trigger" != "connection" ]]; then
-        reconcile_iface "$iface" "$key"
-    fi
+    case "$MANAGEMENT_MODE" in
+        supervisor)
+            apply_nm_supervisor "$iface"
+            processed=$((processed + 1))
+            ;;
+        daemon|hybrid)
+            key="$(lookup_key "$trigger" "$SSID")"
 
-    if ! should_rotate "$iface" "$SSID" "$trigger"; then
-        log "iface $iface key='$key' no rotation needed (trigger=$trigger policy=$ROTATION_POLICY); skip"
-        unchanged=$((unchanged + 1))
-        continue
-    fi
-    if apply_change "$iface" "$key"; then
-        processed=$((processed + 1))
-    else
-        failed=$((failed + 1))
-    fi
+            # For non-connection policies, restore state-recorded MAC if it
+            # drifted (e.g. NM reverted between daemon runs).
+            if [[ "$trigger" != "connection" ]]; then
+                reconcile_iface "$iface" "$key"
+            fi
+
+            if ! should_rotate "$iface" "$SSID" "$trigger"; then
+                log "iface $iface key='$key' no rotation needed (trigger=$trigger policy=$ROTATION_POLICY); skip"
+                unchanged=$((unchanged + 1))
+                continue
+            fi
+
+            # In hybrid mode, also supervise the profile before the
+            # kernel-direct MAC write so NM doesn't fight us mid-call.
+            if [[ "$MANAGEMENT_MODE" == "hybrid" ]]; then
+                apply_nm_supervisor "$iface"
+            fi
+
+            if apply_change "$iface" "$key"; then
+                processed=$((processed + 1))
+            else
+                failed=$((failed + 1))
+            fi
+            ;;
+    esac
 done
 
 log "summary: processed=$processed skipped=$skipped unchanged=$unchanged failed=$failed"

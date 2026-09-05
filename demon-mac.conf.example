@@ -5,18 +5,51 @@
 
 # ===== Master kill-switch =====
 # false  → script exits 0 immediately with a log line; nothing happens
-# true   → script proceeds to ROTATION_POLICY logic below
+# true   → script proceeds to MANAGEMENT_MODE logic below
 ENABLED=true
 
+# ===== Management mode =====
+# How aggressively the daemon manages MAC addresses.
+#
+# supervisor (default) — pure NM configuration: the daemon ensures every
+#                         Wi-Fi profile has cloned-mac-address=stable (or
+#                         random) + mac-address-randomization=2. No kernel
+#                         MAC writes, no state file, no flock.
+#                         Use this for typical laptops with home Wi-Fi.
+#
+# daemon               — kernel-direct MAC management: daemon generates
+#                         random MACs and applies via `ip link set`, writes
+#                         its own state file. Use this for features NM's
+#                         built-in randomization can't provide (MAC_PREFIX,
+#                         daily rotation on wired, self-heal after NM revert).
+#
+# hybrid               — supervisor (configures the profile) + daemon (applies
+#                         its own MAC and tells NM to preserve it). Use this
+#                         when you want both daemon-driven MAC and NM
+#                         hygiene — the daemon sets preserve instead of stable.
+#
+MANAGEMENT_MODE=supervisor
+
+# ===== Target NM setting (supervisor / hybrid) =====
+# What value to enforce on 802-11-wireless.cloned-mac-address:
+#   stable (default) — same MAC per SSID. Add to router ACL once per
+#                       network. Cross-SSID privacy preserved.
+#   random          — fresh MAC on every connection. No ACL possible.
+#                       Maximum in-network privacy.
+#
+# Ignored in pure daemon mode (daemon sets preserve instead).
+NM_CLONED_MAC=stable
+
 # ===== Rotation policy =====
+# Only effective in `daemon` or `hybrid` mode (ignored in supervisor).
+# In supervisor mode, NM itself decides when to rotate (on every connect,
+# per mac-address-randomization).
+#
 # Controls when and how often MAC addresses are randomized.
 #
 # connection — rotate on every NetworkManager pre-up event
-#              (default; laptop / portable use case)
 # boot       — rotate on every boot
-#              (desktop / server that reboots often)
 # once       — rotate the first time invoked, then persist forever
-#              (escape MAC binding once, keep new MAC stable)
 # daily      — rotate if last rotation > 24h ago
 # weekly     — rotate if last rotation > 7d ago
 # monthly    — rotate if last rotation > 30d ago
@@ -32,21 +65,20 @@ ENABLED=true
 #   - PIN_MODE=iface → state key is always iface
 ROTATION_POLICY=connection
 
-# ===== Pin mode =====
+# ===== Pin mode (daemon / hybrid) =====
 # How the script identifies "the same network" for reuse.
 #
-# none  — rotate every trigger (current default; maximum rotation)
+# none  — rotate every trigger (maximum rotation)
 # ssid  — reuse MAC per SSID in connection mode; per iface in boot/rotate.
 #         Connects to MAC ACL on home Wi-Fi without losing rotation between
 #         networks: each SSID gets its own stable MAC, different across SSIDs.
 # iface — always pin per interface (boot/connection both reuse per-iface).
 #
 # Pair with MAC_PREFIX= to constrain generated MACs to a chosen range —
-# useful if your router only allows full-MAC matches (operator adds the
-# pinned MAC once after first connect).
+# useful if your router only allows full-MAC matches.
 PIN_MODE=ssid
 
-# ===== MAC prefix =====
+# ===== MAC prefix (daemon / hybrid only) =====
 # Optional 2-octet prefix for generated MACs. Format: XX:XX (hex).
 # Empty = full random (with first octet forced to 02 for locally-administered
 # unicast).
@@ -58,6 +90,8 @@ PIN_MODE=ssid
 # (bit 0 = multicast = 0, bit 1 = U/L = 1; first_byte & 0x03 == 0x02).
 # Valid first bytes: 02, 06, 0A, 0E, 12, ..., 7E, 82, ..., FE.
 # Invalid prefixes are logged and the script falls back to full random.
+#
+# Ignored in supervisor mode (NM doesn't accept readable prefix syntax).
 MAC_PREFIX=02:11
 
 # ===== Per-iface targeting =====
@@ -69,15 +103,19 @@ MAC_PREFIX=02:11
 #   TARGETS="wlan0,eth0"
 TARGETS=
 
-# ===== State file =====
+# ===== State file (daemon / hybrid only) =====
 # Persists last-rotation timestamp per (iface, ssid) or (iface, "").
 # Format: iface|ssid|mac|iso-ts  (4 columns; ssid may be empty for boot-pin)
 # Legacy 3-column format (iface|mac|ts) is still readable.
 # Used by once / daily / weekly / monthly policies. Survives uninstall.
 # The file is created mode 0600 (MACs are persistent identifiers).
+# Ignored in supervisor mode (NM is the source of truth).
 STATE_FILE=/var/lib/demon-mac/state
 
-# ===== NetworkManager cloned-mac-address policy =====
+# ===== NetworkManager cloned-mac-address policy (daemon / hybrid only) =====
+# Only effective in `daemon` or `hybrid` mode. In supervisor mode the
+# daemon sets cloned-mac-address directly per NM_CLONED_MAC.
+#
 # NM ≥ 1.4 exposes 802-11-wireless.cloned-mac-address /
 # ethernet.cloned-mac-address with values random|stable|preserve|
 # permanent. If the active profile is set to anything other than
@@ -95,7 +133,7 @@ STATE_FILE=/var/lib/demon-mac/state
 #                      stack.
 NM_CLONED_MAC_POLICY=preserve
 
-# ===== IPv6 SLAAC stabilization =====
+# ===== IPv6 SLAAC stabilization (daemon / hybrid only) =====
 # After MAC change, set net.ipv6.conf.<iface>.addr_gen_mode=1 so that
 # IPv6 link-local no longer derives from MAC. Recommended: keep true.
 STABILIZE_IPV6=true

@@ -64,8 +64,9 @@ else fail "ENABLED=false behavior: $out"; fi
 # ----- 6. ROTATION_POLICY=connection, boot trigger → no rotation -----
 write_conf <<EOF
 ENABLED=true
-ROTATION_POLICY=connection
-TARGETS=zzz_nonexistent_iface_12345
+MANAGEMENT_MODE=daemon
+ROTATION_POLICY=daily
+TARGETS=veth-test-a
 STATE_FILE=$WORK/state
 LOG_LEVEL=info
 EOF
@@ -76,6 +77,7 @@ else fail "policy=connection + boot (got: $out)"; fi
 # ----- 7. ROTATION_POLICY=once, empty state → rotation logged -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -107,6 +109,7 @@ fi
 # ----- 8. ROTATION_POLICY=once, state populated → no rotation -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -136,6 +139,7 @@ old_ts="$(date -u -d '2 days ago' +%FT%TZ 2>/dev/null || date -u +%FT%TZ)"
 write_state_populated "veth-test-a" "" "02:ab:cd:ef:01:23" "$old_ts"
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=daily
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -161,6 +165,7 @@ fi
 # ----- 11. Loopback skipped -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=
 STATE_FILE=$WORK/state
@@ -176,6 +181,7 @@ fi
 # ----- 12. Policy gating: connection trigger vs boot trigger -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=
 STATE_FILE=$WORK/state
@@ -191,6 +197,7 @@ fi
 # ----- 13. MAC prefix check via dry-run (full random, no prefix) -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -210,6 +217,7 @@ fi
 # ----- 14. MAC_PREFIX applied to generated MAC -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -228,6 +236,7 @@ fi
 # ----- 15. MAC_PREFIX validation: invalid first byte → fallback to full random -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -251,6 +260,7 @@ fi
 # ----- 16. MAC_PREFIX validation: malformed → fallback -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -268,6 +278,7 @@ fi
 # ----- 17. PIN_MODE=ssid + same SSID → reuse MAC -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 PIN_MODE=ssid
 TARGETS=veth-test-a
@@ -319,6 +330,7 @@ fi
 : > "$WORK/state"
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 PIN_MODE=none
 TARGETS=veth-test-a
@@ -337,6 +349,16 @@ fi
 
 # ----- 20. SSID with special chars works (NM allows Unicode in profile names) -----
 # Just verify the script accepts arbitrary SSID strings without crashing.
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=daemon
+ROTATION_POLICY=once
+PIN_MODE=none
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+: > "$WORK/state"
 out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 bash "$ROOT/demon-mac.sh" connection veth-test-a 'Wi-Fi-с-другом' 2>&1 || true)"
 if [[ "$out" == *"config: policy=once"* ]] || [[ "$out" == *"MAC change OK"* ]] || [[ "$out" == *"new_mac="* ]]; then
     pass "SSID with Unicode/special chars accepted"
@@ -349,6 +371,7 @@ fi
 # ----- 21. Lock file: external holder blocks the daemon -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -373,6 +396,7 @@ fi
 # ----- 22. State file is created mode 0600 -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -395,6 +419,7 @@ fi
 # ----- 23. SSID containing '|' is accepted (lookup gracefully misses) -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -412,6 +437,7 @@ fi
 # Pre-fix grep would match 'fooXbar' against 'foo.bar' because '.' is regex any-char.
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 PIN_MODE=ssid
 TARGETS=veth-test-a
@@ -442,6 +468,7 @@ chmod +x "$WORK/mock_bin/nmcli"
 : > "$WORK/nmcli.log"
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -492,6 +519,7 @@ fi
 : > "$WORK/nmcli.log"
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -512,6 +540,7 @@ fi
 : > "$WORK/nmcli.log"
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -531,6 +560,7 @@ fi
 # Sanity: two distinct SSIDs should yield distinct random MACs with the same prefix.
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=once
 PIN_MODE=ssid
 TARGETS=veth-test-a
@@ -568,6 +598,7 @@ fi
 # (state is fresh, daily policy says no rotate).
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=daily
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -594,6 +625,7 @@ fi
 # ----- 32. daily policy + rotate mode + MAC matches state → no reconcile action -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=daily
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -620,6 +652,7 @@ fi
 # ----- 33. connection mode + MAC drifted → no reconcile (always rotates) -----
 write_conf <<EOF
 ENABLED=true
+MANAGEMENT_MODE=daemon
 ROTATION_POLICY=connection
 TARGETS=veth-test-a
 STATE_FILE=$WORK/state
@@ -640,6 +673,314 @@ if grep -q "DRY_RUN: would down/change/up" <<<"$out"; then
     pass "connection mode + MAC drifted → rotates fresh (overrides reconcile intent)"
 else
     fail "connection mode should rotate (got: $out)"
+fi
+
+# ===== SA-004 supervisor / hybrid mode tests =====
+
+# Mock nmcli setup. Returns 'random' for cloned-mac-address and '0'
+# for mac-address-randomization by default. Individual tests can
+# rewrite the mock before invoking the daemon.
+mkdir -p "$WORK/mock_bin"
+cat > "$WORK/mock_bin/nmcli" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "${DEMON_MAC_NMCLI_LOG:-/tmp/nmcli.log}"
+case "$1" in
+    -t)
+        case "$2" in
+            -g)
+                case "$3" in
+                    connection.type|type)
+                        # Connection type. Tests can override via DEMON_MAC_NMCLI_TYPE.
+                        echo "${DEMON_MAC_NMCLI_TYPE:-802-11-wireless}"
+                        ;;
+                    802-11-wireless.cloned-mac-address|802-3-ethernet.cloned-mac-address|connection.cloned-mac-address|cloned-mac-address)
+                        # Type-specific (and universal, for completeness).
+                        # Override via DEMON_MAC_NMCLI_CLONED.
+                        echo "${DEMON_MAC_NMCLI_CLONED:-random}"
+                        ;;
+                    802-11-wireless.mac-address-randomization)
+                        echo "${DEMON_MAC_NMCLI_RANDOM:-0}"
+                        ;;
+                esac
+                ;;
+        esac
+        ;;
+    connection)
+        : # no-op for modify (success)
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/mock_bin/nmcli"
+
+# ----- 34. Default mode is supervisor -----
+# No MANAGEMENT_MODE set; daemon must default to supervisor and refuse
+# to write kernel MAC.
+write_conf <<EOF
+ENABLED=true
+ROTATION_POLICY=connection
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
+if grep -q "mode=supervisor" <<<"$out"; then
+    pass "default MANAGEMENT_MODE is supervisor"
+else
+    fail "default mode (got: $out)"
+fi
+if grep -q "ip link set\|MAC change OK\|new_mac=" <<<"$out"; then
+    fail "supervisor mode must NOT do kernel MAC writes (got: $out)"
+else
+    pass "supervisor mode does no kernel MAC writes"
+fi
+
+# ----- 35. supervisor + nmcli=stable → idempotent (no nmcli modify) -----
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+DEMON_MAC_NMCLI_CLONED=stable DEMON_MAC_NMCLI_RANDOM=2
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-sup-stable DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_CLONED=stable DEMON_MAC_NMCLI_RANDOM=2 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection wlp-test 2>&1 || true)"
+if grep -q "already supervised" <<<"$out"; then
+    pass "supervisor + profile already correct → idempotent no-op"
+else
+    fail "supervisor idempotent (got: $out)"
+fi
+if ! grep -q "connection modify" "$WORK/nmcli.log"; then
+    pass "supervisor idempotent → no nmcli modify call"
+else
+    fail "supervisor idempotent should not modify (log: $(cat "$WORK/nmcli.log"))"
+fi
+
+# ----- 36. supervisor + nmcli=random → daemon modifies profile to stable -----
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-sup-drift DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_CLONED=random DEMON_MAC_NMCLI_RANDOM=0 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection wlp-test 2>&1 || true)"
+if grep -q "supervised —" <<<"$out" && grep -q "cloned-mac=random->stable" <<<"$out"; then
+    pass "supervisor + nmcli=random → daemon sets cloned-mac=stable"
+else
+    fail "supervisor drift correction (got: $out)"
+fi
+if grep -q "mac-randomization=0->2" <<<"$out"; then
+    pass "supervisor + nmcli=random=0 → daemon sets mac-randomization=2"
+else
+    fail "supervisor randomization fix (got: $out)"
+fi
+
+# ----- 37. supervisor mode + MAC_PREFIX → WARN logged -----
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+MAC_PREFIX=02:11
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
+if grep -q "MAC_PREFIX='02:11' is ignored in supervisor mode" <<<"$out"; then
+    pass "supervisor + MAC_PREFIX → WARN logged"
+else
+    fail "supervisor + MAC_PREFIX warning (got: $out)"
+fi
+
+# ----- 38. supervisor mode + ROTATION_POLICY=daily → WARN logged -----
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+ROTATION_POLICY=daily
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
+if grep -q "ROTATION_POLICY=daily is ignored in supervisor mode" <<<"$out"; then
+    pass "supervisor + ROTATION_POLICY=daily → WARN logged"
+else
+    fail "supervisor + daily warning (got: $out)"
+fi
+
+# ----- 39. invalid MANAGEMENT_MODE → fallback to supervisor -----
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=bogus
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
+if grep -q "MANAGEMENT_MODE='bogus' invalid" <<<"$out" && grep -q "mode=supervisor" <<<"$out"; then
+    pass "invalid MANAGEMENT_MODE → fallback to supervisor with WARN"
+else
+    fail "invalid MANAGEMENT_MODE (got: $out)"
+fi
+
+# ----- 40. invalid NM_CLONED_MAC → fallback to stable -----
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=bogus
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 bash "$ROOT/demon-mac.sh" boot 2>&1 || true)"
+if grep -q "NM_CLONED_MAC='bogus' invalid" <<<"$out" && grep -q "nm_target=stable" <<<"$out"; then
+    pass "invalid NM_CLONED_MAC → fallback to stable with WARN"
+else
+    fail "invalid NM_CLONED_MAC (got: $out)"
+fi
+
+# ----- 41. supervisor mode → no lock file acquired -----
+# No flock should be taken in supervisor mode. Hold an external lock
+# at the daemon's expected path; the daemon must NOT touch it.
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+LOCK_PATH="$WORK/demon-mac.lock"
+rm -f "$LOCK_PATH"
+(
+    exec 9>"$LOCK_PATH"
+    flock -n 9 || { echo "test setup: lock acquire failed" >&2; exit 1; }
+    out_lock="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 \
+        CONNECTION_UUID=test-uuid-sup-nolock DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+        DEMON_MAC_NMCLI_CLONED=stable DEMON_MAC_NMCLI_RANDOM=2 \
+        PATH="$WORK/mock_bin:$PATH" \
+        bash "$ROOT/demon-mac.sh" connection wlp-test 2>&1 || true)"
+    printf '%s' "$out_lock" > "$WORK/sup_nolock_out"
+    exec 9>&-
+)
+if [[ -s "$WORK/sup_nolock_out" ]] && ! grep -q "another instance holds" "$WORK/sup_nolock_out"; then
+    pass "supervisor mode does NOT take flock (no 'another instance holds' log)"
+else
+    fail "supervisor lock behavior (got: $(cat "$WORK/sup_nolock_out" 2>/dev/null))"
+fi
+
+# ----- 42. hybrid mode → supervisor runs AND daemon runs -----
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=hybrid
+ROTATION_POLICY=once
+TARGETS=veth-test-a
+STATE_FILE=$WORK/state
+NM_CLONED_MAC_POLICY=preserve
+LOG_LEVEL=info
+EOF
+: > "$WORK/state"
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-hybrid DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_CLONED=random DEMON_MAC_NMCLI_RANDOM=2 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection veth-test-a 2>&1 || true)"
+if grep -q "mode=hybrid" <<<"$out"; then
+    pass "hybrid mode logged in config line"
+else
+    fail "hybrid mode config log (got: $out)"
+fi
+if grep -q "cloned-mac=.*->preserve" <<<"$out"; then
+    pass "hybrid supervisor: sets cloned-mac-address=preserve (not stable)"
+else
+    fail "hybrid supervisor target (got: $out)"
+fi
+if grep -q "MAC change OK\|DRY_RUN: would down/change/up" <<<"$out"; then
+    pass "hybrid daemon: also does kernel MAC write"
+else
+    fail "hybrid daemon kernel write (got: $out)"
+fi
+
+# ----- 43. supervisor + Ethernet connection → no 802-11-wireless.* writes -----
+# Ethernet connections have no 802-11-wireless.* properties. The
+# supervisor must set connection.cloned-mac-address (universal) and
+# NOT touch 802-11-wireless.mac-address-randomization (which doesn't
+# exist on ethernet profiles).
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-eth DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_TYPE=802-3-ethernet \
+    DEMON_MAC_NMCLI_CLONED=random DEMON_MAC_NMCLI_RANDOM=0 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection eth0 2>&1 || true)"
+if grep -q "802-3-ethernet" <<<"$out"; then
+    pass "supervisor + Ethernet → log line shows connection type"
+else
+    fail "supervisor + Ethernet type log (got: $out)"
+fi
+if grep -q "cloned-mac=random->stable" <<<"$out"; then
+    pass "supervisor + Ethernet → sets connection.cloned-mac-address=stable"
+else
+    fail "supervisor + Ethernet cloned-mac fix (got: $out)"
+fi
+if grep -q "mac-randomization=" <<<"$out"; then
+    fail "supervisor + Ethernet → must NOT touch 802-11-wireless.mac-address-randomization (got: $out)"
+else
+    pass "supervisor + Ethernet → does not touch 802-11-wireless.mac-address-randomization"
+fi
+if ! grep -q "802-11-wireless.mac-address-randomization" "$WORK/nmcli.log"; then
+    pass "supervisor + Ethernet → no nmcli modify on 802-11-wireless.mac-address-randomization"
+else
+    fail "spurious 802-11-wireless.mac-address-randomization write (log: $(cat "$WORK/nmcli.log"))"
+fi
+
+# ----- 44. supervisor + VPN connection → no-op -----
+# VPN/GSM/etc. connections don't have MAC randomization. The supervisor
+# must skip them entirely.
+DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" > "$WORK/nmcli.log"
+write_conf <<EOF
+ENABLED=true
+MANAGEMENT_MODE=supervisor
+NM_CLONED_MAC=stable
+TARGETS=
+STATE_FILE=$WORK/state
+LOG_LEVEL=info
+EOF
+out="$(DEMON_MAC_CONF="$WORK/c.conf" DEMON_MAC_DRY_RUN=1 DEMON_MAC_BYPASS_PHYSICAL=1 \
+    CONNECTION_UUID=test-uuid-vpn DEMON_MAC_NMCLI_LOG="$WORK/nmcli.log" \
+    DEMON_MAC_NMCLI_TYPE=vpn \
+    DEMON_MAC_NMCLI_CLONED=random DEMON_MAC_NMCLI_RANDOM=0 \
+    PATH="$WORK/mock_bin:$PATH" \
+    bash "$ROOT/demon-mac.sh" connection tun0 2>&1 || true)"
+if grep -q "is not Wi-Fi or Ethernet; supervisor no-op" <<<"$out"; then
+    pass "supervisor + VPN → no-op (skips non-Ethernet types)"
+else
+    fail "supervisor + VPN no-op (got: $out)"
+fi
+if [[ -s "$WORK/nmcli.log" ]] && grep -q "connection modify" "$WORK/nmcli.log"; then
+    fail "supervisor + VPN → must not call nmcli modify (log: $(cat "$WORK/nmcli.log"))"
+else
+    pass "supervisor + VPN → no nmcli modify"
 fi
 
 # ----- Cleanup veth if created -----

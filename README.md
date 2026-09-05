@@ -1,11 +1,20 @@
 # demon-mac
 
-MAC address randomizer for sysadmin-owned hosts. Randomizes MAC at boot,
-on each NetworkManager connection, and (optionally) on a periodic schedule,
-with full kill-switch via config and systemd. Supports per-SSID pinning for
-MAC-authenticated networks.
+MAC address supervisor and randomizer for sysadmin-owned hosts.
+The daemon sits on top of NetworkManager: in its default mode it
+configures NM's per-profile MAC randomization settings; in advanced
+modes it generates random MACs and applies them itself.
 
-## Before you install this — try the built-in randomization first
+## Which mode do I want?
+
+| You need… | Use |
+|---|---|
+| Per-SSID stable MAC on Wi-Fi, no extra files, no driver quirks to worry about | [NM built-in](#built-in-networkmanager) (probably you don't need demon-mac at all) |
+| Per-SSID stable MAC on Wi-Fi *and* per-connection stable MAC on Ethernet, with a daemon that ensures the NM setting stays applied across profile resets, new connections, and distro NM upgrades | [`MANAGEMENT_MODE=supervisor`](#supervisor-mode-default) — the default |
+| Per-SSID pinning that survives `nmcli connection delete`, daily rotation on stable wired links, OUI-constrained MAC prefix, self-heal after NM revert | [`MANAGEMENT_MODE=daemon`](#daemon-mode) — full kernel-direct MAC management |
+| All of the above combined | [`MANAGEMENT_MODE=hybrid`](#hybrid-mode) |
+
+## Built-in NetworkManager
 
 Linux distros that ship NetworkManager and/or systemd-networkd already
 have **upstream-supported, distro-tested** MAC randomization built in.
@@ -19,15 +28,12 @@ demon-mac at all.
 
 ### NetworkManager (most desktops and laptops)
 
-NM ≥ 1.4 exposes the per-connection settings you need. There are two
-controls; both live on the connection profile:
+NM ≥ 1.4 exposes the per-connection settings you need:
 
 | Setting | Values | Effect |
 |---|---|---|
 | `802-11-wireless.cloned-mac-address` | `preserve`, `permanent`, `random`, `stable` | `random` = new MAC on every connection; `stable` = new MAC per-SSID, stable across reconnects |
 | `802-11-wireless.mac-address-randomization` | `0` (default), `1` (never), `2` (always) | Master switch — must be `2` to enable |
-
-To enable per-SSID stable randomization on a profile:
 
 ```sh
 nmcli connection modify "<profile-name>" \
@@ -36,26 +42,9 @@ nmcli connection modify "<profile-name>" \
 nmcli connection up "<profile-name>"
 ```
 
-Replace `<profile-name>` with the SSID (or any name; `nmcli connection`
-shows it). Inspect the current value with:
-
-```sh
-nmcli -t -f connection,802-11-wireless.cloned-mac-address,802-11-wireless.mac-address-randomization \
-    connection show "<profile-name>"
-```
-
-Docs:
-- [NetworkManager 802-11-wireless settings reference](https://networkmanager.dev/docs/api/latest/settings-802-11-wireless.html) — `cloned-mac-address`, `mac-address-randomization`, `assigned-mac-address`.
+Docs: [NetworkManager 802-11-wireless settings reference](https://networkmanager.dev/docs/api/latest/settings-802-11-wireless.html).
 
 ### systemd-networkd (servers, minimal installs, NixOS)
-
-systemd-networkd's `.link` files accept `MACAddressPolicy=`:
-
-| Value | Effect |
-|---|---|
-| `persistent` | Default. Stable per-machine MAC derived from `/etc/machine-id` and the device's ID_NET_NAME_* — same on every boot, different from hardware MAC. |
-| `random` | New random MAC on every interface appearance (typically each boot). Locally-administered + unicast bits are set. |
-| `none` | Keep the kernel-assigned MAC. Use this if you want to set a specific MAC with `MACAddress=`. |
 
 ```ini
 # /etc/systemd/network/10-mac-randomize.link
@@ -68,250 +57,189 @@ MACAddressPolicy=random
 
 Docs: [systemd.link(5) — MACAddressPolicy](https://www.freedesktop.org/software/systemd/man/systemd.link.html).
 
-### Why you might still want demon-mac
+## demon-mac supervisor mode (default)
 
-The built-in randomization covers the common case. Reach for demon-mac
-when you need:
+Default `MANAGEMENT_MODE=supervisor`. The daemon does only what NM
+can't do for itself: **ensure the right setting is on every active
+NM-managed connection** — Wi-Fi *and* Ethernet. No kernel MAC
+writes, no state file, no flock.
 
-- **MAC-Authenticated Wi-Fi with per-SSID pinning**: a stable MAC per
-  network, but you only get that out of NM's `stable` mode if you
-  trust NM to keep its state. demon-mac writes its own state file
-  (`/var/lib/demon-mac/state`, mode 0600) and survives reinstalls
-  cleanly.
-- **A constrained prefix**: keep generated MACs inside a chosen
-  16-bit OUI range (`MAC_PREFIX=02:11`) for routers/APs that filter
-  by OUI rather than full-MAC ACL.
-- **Daily/weekly rotation on stable wired links**: NM doesn't
-  rotate on wired connections by default; the systemd timer in
-  demon-mac rotates them on schedule even without network churn.
-- **Self-heal after NM revert**: if NM's `cloned-mac-address`
-  setting was changed by hand or by another tool and NM reverts
-  your MAC, demon-mac's `NM_CLONED_MAC_POLICY=preserve` reasserts
-  preserve on the profile. The built-in mechanism has no such
-  watchdog.
+On every trigger (`boot`, `connection` pre-up, daily `rotate.timer`)
+the daemon:
 
-If none of that matters to you, uninstall is `sudo make uninstall`
-and you're back to the disto's default behavior — no daemon, no
-service, no state file.
+1. Looks up the active NM connection for the iface (via `$CONNECTION_UUID`
+   from the dispatcher, or via `nmcli device show` for boot/rotate).
+2. Determines the connection type — only `802-11-wireless` and
+   `802-3-ethernet` are eligible. VPN / GSM / bridge / etc. are
+   skipped (logged).
+3. Reads the current `connection.cloned-mac-address` (the type-agnostic
+   setting that works for both Wi-Fi and Ethernet) and, for Wi-Fi,
+   `802-11-wireless.mac-address-randomization` (the wireless master
+   switch).
+4. If either differs from the configured target, calls
+   `nmcli connection modify ...` to set it.
+
+`NM_CLONED_MAC=stable` (default) sets `cloned-mac-address=stable` on
+every active profile. Per-SSID pin on Wi-Fi; stable per-NM-profile on
+Ethernet (Ethernet has no SSID concept — `cloned-mac-address=stable`
+means "stable across reconnects of this connection profile").
+
+If `NM_CLONED_MAC=random`, demon-mac sets `cloned-mac-address=random`
+on every profile (fresh MAC per connection).
+
+The supervisor never touches `ip link`. It only edits NM profiles.
+This means:
+
+- No driver-compat issues (no `brcmfmac` surprises).
+- No link flap on rotation (NM handles it cleanly).
+- No state file to manage.
+- Survives profile deletes — when NM creates a new profile, the next
+  `pre-up` event supervises it.
+
+## Daemon mode
+
+`MANAGEMENT_MODE=daemon`. The daemon does what NM can't: **generates
+random MACs and applies them via `ip link set address`**. This is the
+original demon-mac behavior.
+
+Use this mode when supervisor isn't enough:
+
+- **`MAC_PREFIX=02:11`** — constrain generated MACs to a chosen 16-bit
+  OUI range. NM's analogue is `generate-mac-address-mask` with bit-mask
+  syntax; demon-mac uses a readable prefix.
+- **Daily/weekly/monthly rotation on stable wired links** — NM doesn't
+  randomize wired. The `demon-mac-rotate.timer` fires daily and the
+  daemon rotates if the state age exceeds the policy threshold.
+- **Self-heal after NM revert** — if some other tool changes the NM
+  profile back, the daemon's `reconcile_iface` (boot/rotate modes)
+  re-applies the state-recorded MAC and re-pins `preserve`.
+- **Operator-readable state** — `/var/lib/demon-mac/state` (mode 0600)
+  records last-rotation timestamp per (iface, ssid). Survives NM reset,
+  uninstall, distro upgrade.
+
+Daemon mode also supports:
+
+- `PIN_MODE=ssid` — different MAC per Wi-Fi network.
+- `ROTATION_POLICY=once` / `daily` / `weekly` / `monthly` — schedule rotation.
+- `NM_CLONED_MAC_POLICY=preserve` — daemon enforces `preserve` on the
+  NM profile so the daemon's MAC isn't overwritten on reactivation.
+
+## Hybrid mode
+
+`MANAGEMENT_MODE=hybrid`. Both supervisor and daemon run. Useful when
+you want all of:
+
+- Daily timer rotation on wired (needs daemon).
+- Per-SSID MAC ACL on home Wi-Fi (needs daemon's pinning).
+- Plus NM's hygiene guarantee that no other tool reverted the profile.
+
+In hybrid mode, supervisor sets `cloned-mac-address=preserve` and
+`mac-address-randomization=0` on the active profile — so NM does not
+override the daemon's MAC, but the daemon's MAC still gets re-pinned
+on every dispatcher event.
 
 ## Quick start
 
 ```sh
-# install (requires root)
+# install (requires root). Default mode = supervisor.
 sudo make install
-
-# disable (three layers)
-sudo sed -i 's/^ENABLED=true/ENABLED=false/' /etc/demon-mac.conf   # soft
-sudo systemctl disable --now demon-mac-boot                       # hard
-sudo make uninstall                                                # full
 
 # status
 systemctl status demon-mac-boot
 systemctl list-timers demon-mac-rotate
 journalctl -t demon-mac -n 50
-ip link show dev eth0 | grep ether
-cat /var/lib/demon-mac/state
+nmcli -t -f connection,802-11-wireless.cloned-mac-address \
+    connection show --active
+
+# disable (three layers)
+sudo sed -i 's/^ENABLED=true/ENABLED=false/' /etc/demon-mac.conf   # soft
+sudo systemctl disable --now demon-mac-boot                       # hard
+sudo make uninstall                                                # full
+```
+
+To switch to kernel-direct mode (full daemon, OUI prefix, daily timer):
+
+```sh
+sudo sed -i 's/^MANAGEMENT_MODE=supervisor/MANAGEMENT_MODE=daemon/' /etc/demon-mac.conf
+sudo make install
+sudo systemctl restart demon-mac-boot demon-mac-rotate.timer
 ```
 
 ## Configuration (`/etc/demon-mac.conf`)
 
-| Key | Default | Meaning |
-|---|---|---|
-| `ENABLED` | `true` | Master kill-switch |
-| `ROTATION_POLICY` | `connection` | One of `connection`, `boot`, `once`, `daily`, `weekly`, `monthly` |
-| `PIN_MODE` | `none` | One of `none`, `ssid`, `iface` — see [MAC authentication](#mac-authentication-on-filtered-routers) |
-| `MAC_PREFIX` | empty | `XX:XX` hex prefix constraining generated MACs; empty = full random |
-| `TARGETS` | empty | Empty = all physical; else comma-separated iface list |
-| `STATE_FILE` | `/var/lib/demon-mac/state` | Per-(iface, ssid) rotation record (operator-managed, mode 0600) |
-| `NM_CLONED_MAC_POLICY` | `preserve` | `preserve` (default) / `none` — see [NetworkManager interaction](#networkmanager-interaction) |
-| `STABILIZE_IPV6` | `true` | sysctl `addr_gen_mode=1` after MAC change |
-| `LOG_FILE` | empty | Optional file log (journald always) |
-| `LOG_LEVEL` | `info` | debug / info / warn / error |
-
-## Rotation policies
-
-| Policy | Behavior | Trigger used |
-|---|---|---|
-| `connection` | Rotate on every NM `pre-up` | `connection` |
-| `boot` | Rotate on every boot | `boot` |
-| `once` | Rotate once per (iface, ssid), persist forever | first trigger fires |
-| `daily` | Rotate if last rotation > 24h ago | `connection` + `rotate` timer |
-| `weekly` | Rotate if last rotation > 7d ago | `connection` + `rotate` timer |
-| `monthly` | Rotate if last rotation > 30d ago | `connection` + `rotate` timer |
-
-For periodic policies, the `demon-mac-rotate.timer` ensures rotation
-happens even without network churn (e.g., stable ethernet at home for a
-week). Each policy is applied per-(iface, ssid) — see [MAC authentication](#mac-authentication-on-filtered-routers).
-
-## MAC authentication on filtered routers
-
-If your router uses MAC-based ACL (typical home Wi-Fi), default
-`PIN_MODE=none` breaks the connection on every reconnect because the
-MAC rotates. Two cooperating features solve this:
-
-### `PIN_MODE=ssid` — reuse MAC per Wi-Fi network
-
-```sh
-PIN_MODE=ssid
-```
-
-The NetworkManager dispatcher passes `$CONNECTION_ID` (typically the
-SSID for Wi-Fi) to the script. The state file then keys on
-`(iface, ssid)`:
-
-- First connect to `home-wifi` → generate MAC A, save
-- Reconnect to `home-wifi` → reuse MAC A
-- First connect to `work-wifi` → generate MAC B (different), save
-- Reconnect to `work-wifi` → reuse MAC B
-
-**Trade-off**: within a network, MAC is stable (so the router keeps
-recognising you). Between networks, MAC is different (privacy
-preserved across SSIDs).
-
-For boot and rotate modes, there's no SSID context, so they fall back
-to per-iface pin (`iface||mac|ts` in state file).
-
-### `MAC_PREFIX=02:11` — constrain to a chosen range
-
-```sh
-MAC_PREFIX=02:11
-```
-
-Generated MAC = `02:11:XX:XX:XX:XX` (16-bit prefix fixed, 32 bits random).
-First byte MUST be locally-administered + unicast
-(`byte & 0x03 == 0x02`); invalid prefixes fall back to full random with
-a WARN message.
-
-Useful when:
-- You want all generated MACs to come from a recognisable range
-- Your router allows range-based ACL (rare on home gear, common on
-  enterprise APs)
-- Combined with `PIN_MODE=ssid`: per-network pinned MAC within a
-  consistent OUI
-
-### Combined: pinned per SSID + constrained prefix
-
-```sh
-ROTATION_POLICY=once      # rotate once per SSID, persist forever
-PIN_MODE=ssid            # reuse per network
-MAC_PREFIX=02:11         # constrain to chosen range
-```
-
-Result: each SSID gets its own stable MAC within `02:11:...`. Add
-the pinned MAC to your router's ACL once per SSID, after first
-connect.
-
-### Setup steps for MAC-auth router
-
-1. `PIN_MODE=ssid` + desired `ROTATION_POLICY` + (optionally) `MAC_PREFIX`
-2. `sudo make install`
-3. Connect to each SSID once. Find the pinned MAC:
-   ```sh
-   cat /var/lib/demon-mac/state
-   ip link show dev wlan0 | grep ether
-   ```
-4. Add the MAC to your router's MAC ACL (each SSID independently)
-5. From now on, reconnects reuse the MAC and pass ACL
+| Key | Default | Mode | Meaning |
+|---|---|---|---|
+| `ENABLED` | `true` | all | Master kill-switch |
+| `MANAGEMENT_MODE` | `supervisor` | all | `supervisor` / `daemon` / `hybrid` |
+| `NM_CLONED_MAC` | `stable` | supervisor / hybrid | Target `cloned-mac-address`: `stable` or `random` |
+| `ROTATION_POLICY` | `connection` | daemon / hybrid | `connection`, `boot`, `once`, `daily`, `weekly`, `monthly` |
+| `PIN_MODE` | `none` | daemon / hybrid | `none` / `ssid` / `iface` |
+| `MAC_PREFIX` | empty | daemon / hybrid | `XX:XX` hex prefix; ignored in supervisor |
+| `TARGETS` | empty | all | Empty = all physical; else comma-separated iface list |
+| `STATE_FILE` | `/var/lib/demon-mac/state` | daemon / hybrid | Mode 0600. Not used in supervisor |
+| `NM_CLONED_MAC_POLICY` | `preserve` | daemon / hybrid | `preserve` / `none` — see daemon mode docs |
+| `STABILIZE_IPV6` | `true` | daemon / hybrid | sysctl `addr_gen_mode=1` after MAC change |
+| `LOG_FILE` | empty | all | Optional file log (journald always) |
+| `LOG_LEVEL` | `info` | all | debug / info / warn / error |
 
 ## Triggers
 
+All three triggers fire `demon-mac.sh`. The behavior differs by mode:
+
 - **`demon-mac-boot.service`** — systemd oneshot at multi-user.target,
-  runs `demon-mac boot` (iterates all physical ifaces).
+  invokes `demon-mac boot`. Iterates physical ifaces.
+  - **supervisor**: ensures each iface's NM profile has the right setting.
+  - **daemon**: rotates per `ROTATION_POLICY`.
 - **`demon-mac-rotate.timer`** — daily systemd timer with 15-min
-  randomized delay; activates `demon-mac-rotate.service` which runs
-  `demon-mac rotate` (iterates all physical ifaces, checks state).
+  randomized delay; invokes `demon-mac rotate`.
+  - **supervisor**: idempotent re-check on all physical ifaces.
+  - **daemon**: rotates if state age exceeds policy threshold.
 - **`/etc/NetworkManager/dispatcher.d/99-demon-mac`** — NM dispatcher
-  hook; reacts to `pre-up` event, runs
-  `demon-mac connection <iface> <SSID>` (NM `$CONNECTION_ID`).
-  Forwards `$CONNECTION_UUID` as env so the daemon can enforce
-  `cloned-mac-address=preserve` on the profile.
-
-## NetworkManager interaction
-
-NetworkManager ≥ 1.4 exposes `802-11-wireless.cloned-mac-address` /
-`ethernet.cloned-mac-address` on each connection profile. Values are
-`random`, `stable`, `preserve`, or `permanent`. The daemon sets the
-MAC via `ip link set address` on `pre-up`, but if the active profile
-is set to anything other than `preserve`, NM will rewrite the MAC on
-the next activation — making the daemon's work invisible.
-
-Default behavior (`NM_CLONED_MAC_POLICY=preserve`): after every
-successful rotation, the daemon calls
-`nmcli connection modify <UUID> cloned-mac-address preserve` on the
-active profile. Idempotent — no-op if already `preserve`. Requires
-`nmcli` in `PATH` and `CONNECTION_UUID` exported by the dispatcher
-(99-demon-mac does this). Boot/rotate triggers skip this — there's
-no profile context.
-
-Set `NM_CLONED_MAC_POLICY=none` if you manage the profile by hand or
-don't use NM.
-
-To inspect the current profile value:
-
-```sh
-nmcli -t -g 802-11-wireless.cloned-mac-address,cloned-mac-address \
-    con show uuid "$CONNECTION_UUID"
-```
-
-The daemon's MAC change is verified by reading the link back
-immediately after `ip link set address`. Some drivers (notably
-`brcmfmac` and several Realtek USB sticks) silently ignore address
-changes; in that case the daemon logs
-`post-set MAC mismatch: ...` and returns failure instead of
-recording a misleading success.
-
-## Components
-
-- `demon-mac.sh` — main script; modes `boot`, `connection <iface> <ssid>`,
-  `rotate`
-- `demon-mac.conf.example` — config template
-- `systemd/demon-mac-boot.service` — boot-time oneshot
-- `systemd/demon-mac-rotate.service` — periodic oneshot
-- `systemd/demon-mac-rotate.timer` — daily calendar trigger
-- `networkmanager/99-demon-mac` — dispatcher (`pre-up`, passes SSID)
-- `install.sh` / `uninstall.sh` — system install/uninstall
-- `Makefile` — install / uninstall / test / lint targets
-- `tests/smoke.sh` — 25 tests: policy matrix + state validation +
-  per-SSID pinning + prefix validation + legacy state compat
+  hook; reacts to `pre-up` event, invokes
+  `demon-mac connection <iface> <SSID>`. Forwards `$CONNECTION_UUID`
+  as env so the daemon can address the right profile.
+  - **supervisor**: ensures the new profile has the right setting.
+  - **daemon**: rotates the MAC and enforces `cloned-mac-address=preserve`.
 
 ## Caveats
 
-- **Breaks**: MAC-bound DHCP without ACL pre-add, captive portals with
-  MAC ACL (unless using `PIN_MODE=ssid`), hardware-bound licensing.
-- **Wi-Fi `down/up` drops the link for ~100–500 ms.** Every rotation
-  on a Wi-Fi iface drops all active TCP sessions, breaks VoIP/VPN
-  keepalive, and interrupts any in-flight downloads. This is the
-  cost of changing the MAC while the interface is up; only some
-  drivers accept an address change without a link flap. If you need
-  unbroken Wi-Fi sessions, use a wired `TARGETS` entry and disable
-  rotation on the wireless iface (e.g. `TARGETS=eth0`).
-- **Wi-Fi drivers**: `down/up` works for most (`iwlwifi`, `ath9k`,
-  `mt76`, `rtw88`). `brcmfmac` (Broadcom) and several Realtek USB
-  sticks either reject the MAC change silently or refuse while
-  associated; the daemon verifies the post-set MAC and logs
-  `post-set MAC mismatch` on rejection. Check `dmesg` if rotation
-  appears to no-op.
-- **IPv6 link-local** changes with MAC; `STABILIZE_IPV6=true` sets
-  `addr_gen_mode=1` (random but not MAC-derived).
-- **NetworkManager MAC race**: see [NetworkManager interaction](#networkmanager-interaction).
-  Without `NM_CLONED_MAC_POLICY=preserve` (or a hand-set profile), NM
-  may overwrite the daemon's MAC on the next reactivation.
+- **Wi-Fi `down/up` drops the link for ~100–500 ms** — daemon mode only.
+  Supervisor doesn't touch the kernel. If you need unbroken Wi-Fi
+  sessions, stay on supervisor or use a wired `TARGETS` entry.
+- **Wi-Fi drivers**: daemon mode does `down/up` for most drivers
+  (`iwlwifi`, `ath9k`, `mt76`, `rtw88`). `brcmfmac` (Broadcom) and
+  several Realtek USB sticks either reject the MAC change silently
+  or refuse while associated; the daemon verifies the post-set MAC
+  and logs `post-set MAC mismatch` on rejection. Check `dmesg`.
+- **IPv6 link-local**: daemon mode sets `addr_gen_mode=1` so SLAAC LL
+  no longer derives from the kernel MAC. In supervisor mode NM picks
+  its own scheme.
 - **Per-SSID pinning weakens in-network privacy** — same MAC across
   visits; visit frequency visible to network-side logging. Cross-SSID
   privacy preserved.
-- **Concurrent triggers**: a `flock` on
-  `<state_dir>/demon-mac.lock` serializes boot + rotate.timer (and
-  any race between dispatcher and timer). If you see
-  `another instance holds ... exiting`, that's expected — the other
-  invocation is in progress.
-- **State file is mode 0600** by design (MACs are persistent
-  identifiers; the dir is 0700). Operators reading `/var/lib/demon-mac/`
-  need root.
+- **Concurrent triggers** (daemon / hybrid only): `flock` on
+  `<state_dir>/demon-mac.lock` serializes boot + rotate.timer. The
+  loser exits 0 with `another instance holds ... exiting`. Supervisor
+  mode takes no flock.
+- **State file is mode 0600** (daemon / hybrid). Supervisor doesn't
+  write one. Reading `/var/lib/demon-mac/` requires root.
+
+## Migration from earlier versions
+
+The default mode changed from `daemon` to `supervisor`. To keep the
+old kernel-direct behavior, add to `/etc/demon-mac.conf`:
+
+```
+MANAGEMENT_MODE=daemon
+```
+
+Then `sudo make install` and restart the units. Existing
+`/var/lib/demon-mac/state` keeps working — same format, same perms.
 
 ## Tests
 
 ```sh
-make test         # all 25 smoke tests
+make test         # 57 smoke tests: mode dispatch + supervisor + hybrid + daemon
 make lint         # bash -n on scripts
 ```
 

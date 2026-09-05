@@ -2,11 +2,40 @@
 
 ## Goal
 
-Randomize host MAC address at boot, on each network connection, and on a
-periodic schedule. Operator can choose rotation policy via a single
-config key, and disable via 3 layers (config flag, systemd disable,
-uninstall). Supports per-SSID pinning and 2-octet MAC prefix for use
-with MAC-Authenticated networks.
+Sit on top of NetworkManager and either (a) ensure NM's built-in
+per-profile MAC randomization is configured correctly (supervisor
+mode, default), or (b) take over MAC management from NM with
+kernel-direct MAC writes, persistent state, and operator-readable
+audit (daemon / hybrid mode).
+
+## Layered model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 1: NetworkManager built-in                                │
+│   `802-11-wireless.cloned-mac-address = stable|random`           │
+│   `802-11-wireless.mac-address-randomization = 2`                │
+│   → upstream-supported, distro-tested, covers most use cases    │
+└─────────────────────────────────────────────────────────────────┘
+                                ▲
+                                │ configures / supervises
+                                │
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 2: demon-mac (default)                                    │
+│   supervisor mode — idempotent `nmcli connection modify`        │
+│   ensures Layer 1 is set on every Wi-Fi profile.                │
+│   No kernel writes. No state file. No flock.                    │
+└─────────────────────────────────────────────────────────────────┘
+                                ▲
+                                │ (opt-in) takes over MAC management
+                                │
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 3: demon-mac kernel-direct                                │
+│   daemon / hybrid mode — `ip link set address` + state file     │
+│   + flock + reconcile. Required for MAC_PREFIX, daily timer     │
+│   on wired, PIN_MODE=ssid with explicit rotation, self-heal.     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Components
 
@@ -15,42 +44,47 @@ with MAC-Authenticated networks.
 │ triggers                                                         │
 │   ├─ systemd: demon-mac-boot.service (oneshot @ multi-user)     │
 │   ├─ NM dispatcher: 99-demon-mac (pre-up event)                 │
-│   │     └─ argv3 = $CONNECTION_ID (SSID/profile name)            │
+│   │     └─ argv3 = $CONNECTION_ID, env $CONNECTION_UUID         │
 │   └─ systemd timer: demon-mac-rotate.timer (OnCalendar=daily)   │
 │       └─ → demon-mac-rotate.service → demon-mac rotate          │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ demon-mac.sh <mode> [iface] [ssid]                                │
+│ demon-mac.sh <mode> [iface] [ssid]                               │
 │   mode = boot | connection | rotate                              │
-│   argv2 = iface (connection mode only)                           │
-│   argv3 = ssid  (connection mode only; empty for boot/rotate)    │
+│   MANAGEMENT_MODE = supervisor | daemon | hybrid                 │
 │                                                                    │
 │   1. parse args (exit 64 on bad)                                  │
 │   2. source /etc/demon-mac.conf                                   │
 │   3. ENABLED gate (exit 0 if not true)                            │
-│   4. validate MAC_PREFIX (locally-administered first byte)        │
-│   5. defaults: ROTATION_POLICY=connection, STATE_FILE=...        │
-│   6. lookup_key(trigger, iface, ssid):                            │
-│        - connection + PIN_MODE=ssid + ssid non-empty → ssid      │
-│        - else → "" (per-iface pin)                                │
-│   7. iterate physical ifaces (filtered by TARGETS)                │
-│   8. should_rotate(iface, ssid, trigger) → checks ROTATION_POLICY│
-│        + reads state for (iface, key)                             │
-│   9. apply_change(iface, key):                                    │
-│        - generate_mac() → prefix:XX:XX:XX:XX or full random       │
-│        - ip link set down / address / / /                          │
-│        - sysctl addr_gen_mode=1 (if STABILIZE_IPV6=true)         │
-│        - write_state(iface, key, mac, iso-ts)                    │
+│   4. defaults: MANAGEMENT_MODE=supervisor, NM_CLONED_MAC=stable │
+│   5. validate MAC_PREFIX, MANAGEMENT_MODE, NM_CLONED_MAC, etc.  │
+│   6. acquire flock (daemon / hybrid only)                        │
+│   7. iterate physical ifaces (filtered by TARGETS)               │
+│   8. dispatch by MANAGEMENT_MODE:                                 │
+│      - supervisor: apply_nm_supervisor(iface)                    │
+│        * resolve active NM connection UUID                        │
+│        * read current settings                                    │
+│        * nmcli modify if drifted (idempotent)                     │
+│      - daemon / hybrid:                                          │
+│        * reconcile_iface (boot/rotate only)                       │
+│        * should_rotate(iface, ssid, trigger)                     │
+│        * if hybrid: apply_nm_supervisor(iface)                   │
+│        * apply_change(iface, key):                               │
+│          - generate_mac() → prefix:XX:XX:XX:XX or full random    │
+│          - ip link set down / address / up                        │
+│          - sysctl addr_gen_mode=1 (if STABILIZE_IPV6=true)        │
+│          - enforce cloned-mac-address=preserve on profile         │
+│          - write_state(iface, key, mac, iso-ts)                   │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ audit
-                        │
+│ audit                                                            │
 │   ├─ journald (always, tag "demon-mac")                          │
-│   └─ LOG_FILE (if set, append-only)                               │
+│   ├─ LOG_FILE (if set, append-only)                               │
+│   └─ state file (daemon / hybrid, mode 0600)                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -91,6 +125,7 @@ same iface (so the file converges to new format over time).
 - File is created with mode `0600`, parent dir mode `0700` —
   MACs are persistent identifiers and should not be world-readable
   on a multi-user system.
+- Not used in supervisor mode (NM is the source of truth for MAC state).
 
 ## MAC generation
 
@@ -171,10 +206,10 @@ on `ROTATION_POLICY` and the resolved lookup key:
 ## Concurrency / single-flight
 
 `boot`, `rotate.timer` and (when wired) the dispatcher can all
-invoke the daemon within seconds of each other. The first thing
-the daemon does after the ENABLED gate is acquire a non-blocking
-`flock` on `<state_dir>/demon-mac.lock`. The loser exits 0 with
-a log line. This serializes:
+invoke the daemon within seconds of each other. In `daemon` /
+`hybrid` mode, the daemon acquires a non-blocking `flock` on
+`<state_dir>/demon-mac.lock` immediately after the ENABLED gate.
+The loser exits 0 with a log line. This serializes:
 
 - concurrent state-file writes (the `mktemp`+`mv` is atomic on a
   single FS, but two writers can still race on read-modify-write),
@@ -184,35 +219,47 @@ a log line. This serializes:
 The lock lives in the state directory (same local FS as the state
 file, so `flock` semantics hold).
 
+Supervisor mode takes no lock — NM handles its own concurrency on
+the profile, and the daemon only does idempotent `nmcli modify`
+calls.
+
 ## NetworkManager interaction
 
-NM ≥ 1.4 stores `802-11-wireless.cloned-mac-address` /
-`ethernet.cloned-mac-address` on each connection profile. If the
-profile is `random`/`stable`/`permanent`, NM rewrites the MAC on
-profile activation — the daemon's `ip link set address` becomes a
-no-op.
+Two modes, opposite directions:
 
-With `NM_CLONED_MAC_POLICY=preserve` (default), after every
-successful `connection`-mode rotation the daemon idempotently
-calls:
+**Supervisor mode (default)** — daemon configures NM to do the
+randomization itself. Reads the profile's current
+`802-11-wireless.cloned-mac-address` and
+`802-11-wireless.mac-address-randomization`, compares to
+`NM_CLONED_MAC` / `2`, and idempotently calls
+`nmcli connection modify uuid $CONNECTION_UUID ...` when drift is
+detected. Target values:
+- `cloned-mac-address = $NM_CLONED_MAC` (`stable` by default — per-SSID pin)
+- `mac-address-randomization = 2` (always randomize)
 
-```
-nmcli connection modify uuid "$CONNECTION_UUID" \
-    cloned-mac-address preserve
-```
+**Daemon mode** — daemon takes over MAC management. After every
+successful `connection`-mode rotation, daemon calls
+`nmcli connection modify uuid $CONNECTION_UUID cloned-mac-address preserve`
+(`NM_CLONED_MAC_POLICY=preserve`, default) so NM doesn't overwrite
+the daemon's MAC on next reactivation. Idempotent — skipped if
+already `preserve`.
 
-(Skipped if already `preserve`; requires `nmcli` in `PATH` and
-`CONNECTION_UUID` exported by the dispatcher — `99-demon-mac`
-does the export.) The boot and rotate triggers skip this — there's
-no profile context in those modes.
+**Hybrid mode** — supervisor runs first, setting
+`cloned-mac-address=preserve` + `mac-address-randomization=0` (so NM
+won't override the daemon's MAC), then daemon applies kernel MAC
+and writes state.
+
+Both modes require `nmcli` in `PATH` and `CONNECTION_UUID` exported
+by the dispatcher (`99-demon-mac` does the export).
 
 ## Failure isolation
 
 The script always exits 0 unless argument parsing fails (exit 64)
-or the daemon was rejected by the lock. Per-iface errors (driver
-rejects, MAC collision, down/up failure, post-set mismatch) are
-logged but do not propagate. This ensures systemd boot proceeds
-and NM does not retry on its own.
+or the daemon was rejected by the lock (daemon / hybrid only).
+Per-iface errors (driver rejects, MAC collision, down/up failure,
+post-set mismatch, `nmcli modify` failure) are logged but do not
+propagate. This ensures systemd boot proceeds and NM does not
+retry on its own.
 
 ## Backward compatibility
 
